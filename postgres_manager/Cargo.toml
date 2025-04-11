@@ -7,7 +7,7 @@ edition = "2021"
 log = "0.4"
 log4rs = "1.2"
 tempfile = "3.10.1"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4.11", features = ["derive", "env"] }
 tokio = { version = "1.36", features = ["full"] }
 tokio-postgres = "0.7"
 native-tls = "0.2"

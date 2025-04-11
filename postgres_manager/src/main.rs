@@ -87,22 +87,32 @@ enum Commands {
 
     #[command(about = "Browse and restore S3 snapshots using TUI")]
     BrowseSnapshots {
-        #[arg(help = "S3 bucket containing the snapshots")]
+        /// S3 bucket containing the snapshots
+        #[arg(long, env = "S3_BUCKET")]
         bucket: Option<String>,
 
-        #[arg(help = "AWS region")]
+        /// AWS region
+        #[arg(long, env = "S3_REGION")]
         region: Option<String>,
 
-        #[arg(long, help = "Custom endpoint URL (e.g. for MinIO)")]
+        /// Filter S3 objects by prefix
+        #[arg(long, env = "S3_PREFIX")]
+        prefix: Option<String>,
+
+        /// Custom endpoint URL (e.g. for MinIO)
+        #[arg(long, env = "S3_ENDPOINT_URL")]
         endpoint_url: Option<String>,
 
-        #[arg(long, help = "AWS access key ID")]
+        /// AWS access key ID
+        #[arg(long, env = "S3_ACCESS_KEY_ID")]
         access_key_id: Option<String>,
 
-        #[arg(long, help = "AWS secret access key")]
+        /// AWS secret access key
+        #[arg(long, env = "S3_SECRET_ACCESS_KEY")]
         secret_access_key: Option<String>,
 
-        #[arg(long, help = "Use path-style addressing")]
+        /// Use path-style addressing
+        #[arg(long, env = "S3_PATH_STYLE", default_value = "true")]
         path_style: bool,
     },
 }
@@ -313,7 +323,6 @@ async fn main() -> Result<()> {
     log4rs::init_config(log_config)?;
     info!("Starting postgres_manager");
 
-
     let cli: Cli = Cli::parse();
     let client = connect(&cli).await?;
 
@@ -359,10 +368,11 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Commands::BrowseSnapshots { bucket, region, endpoint_url, access_key_id, secret_access_key, path_style } => {
+        Commands::BrowseSnapshots { bucket, region, endpoint_url, access_key_id, secret_access_key, path_style, prefix } => {
             if let Some(snapshot_key) = tui::run_tui(
                 bucket.clone(),
                 region.clone(),
+                prefix.clone(),
                 endpoint_url.clone(),
                 access_key_id.clone(),
                 secret_access_key.clone(),

@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use aws_sdk_s3::{Client as S3Client, config::Credentials};
-use log::debug;
+use log::{debug, error, warn};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -21,8 +21,10 @@ use std::io;
 
 #[derive(Debug, Default)]
 pub struct S3Config {
+    pub error_message: Option<String>,
     pub bucket: String,
     pub region: String,
+    pub prefix: String,
     pub endpoint_url: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
@@ -35,8 +37,9 @@ enum InputMode {
     Editing,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum FocusField {
+    Prefix,
     Bucket,
     Region,
     EndpointUrl,
@@ -60,6 +63,7 @@ impl SnapshotBrowser {
     pub fn new(
         bucket: Option<String>,
         region: Option<String>,
+        prefix: Option<String>,
         endpoint_url: Option<String>,
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
@@ -72,10 +76,12 @@ impl SnapshotBrowser {
             config: S3Config {
                 bucket: bucket.unwrap_or_default(),
                 region: region.unwrap_or_else(|| "us-west-2".to_string()),
+                prefix: prefix.unwrap_or_default(),
                 endpoint_url,
                 access_key_id,
                 secret_access_key,
                 path_style,
+                error_message: None,
             },
             input_mode: InputMode::Normal,
             focus: FocusField::Bucket,
@@ -83,7 +89,33 @@ impl SnapshotBrowser {
         }
     }
 
+    pub async fn verify_s3_settings(&self) -> Result<()> {
+        debug!("Verifying S3 settings");
+        if self.config.bucket.is_empty() {
+            error!("S3 bucket name is empty");
+            return Err(anyhow!("S3 bucket name is required"));
+        }
+        if self.config.region.is_empty() {
+            error!("AWS region is empty");
+            return Err(anyhow!("AWS region is required"));
+        }
+        if self.config.access_key_id.is_none() || self.config.secret_access_key.is_none() {
+            error!("AWS credentials are missing");
+            return Err(anyhow!("AWS credentials are required"));
+        }
+        Ok(())
+    }
+
+    fn set_error(&mut self, message: Option<String>) {
+        self.config.error_message = message;
+    }
+
     async fn init_s3_client(&mut self) -> Result<()> {
+        if let Err(e) = self.verify_s3_settings().await {
+            error!("Failed to verify S3 settings: {}", e);
+            self.set_error(Some(format!("Error: {}", e)));
+            return Err(e);
+        }
         debug!("Initializing S3 client with config: {:?}", self.config);
         debug!("Creating config loader with region: {}", self.config.region);
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -119,22 +151,72 @@ impl SnapshotBrowser {
         Ok(())
     }
 
+    pub async fn test_s3_connection(&mut self) -> Result<()> {
+        debug!("Testing S3 connection");
+        match self.s3_client.as_ref() {
+            Some(client) => {
+                match client.list_buckets().send().await {
+                    Ok(_) => {
+                        debug!("Successfully connected to S3");
+                        self.set_error(None);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to S3: {}", e);
+                        self.set_error(Some(format!("Error: Failed to connect to S3: {}", e)));
+                        Err(anyhow!("Failed to connect to S3: {}", e))
+                    }
+                }
+            }
+            None => {
+                error!("S3 client not initialized");
+                Err(anyhow!("S3 client not initialized"))
+            }
+        }
+    }
+
     pub async fn load_snapshots(&mut self) -> Result<()> {
         debug!("Loading snapshots from bucket: {}", self.config.bucket);
         if self.s3_client.is_none() {
-            self.init_s3_client().await?
+            if let Err(e) = self.init_s3_client().await {
+                error!("Failed to initialize S3 client: {}", e);
+                return Err(e);
+            }
+            if let Err(e) = self.test_s3_connection().await {
+                error!("Failed to connect to S3: {}", e);
+                return Err(e);
+            }
         }
 
         if self.config.bucket.is_empty() {
             return Ok(());
         }
 
-        let client = self.s3_client.as_ref().unwrap();
-        debug!("Listing objects in bucket {}", self.config.bucket);
-        let objects = client.list_objects_v2()
-            .bucket(&self.config.bucket)
-            .send()
-            .await?;
+        let client = self.s3_client.as_ref().ok_or_else(|| {
+            error!("S3 client not initialized");
+            anyhow!("S3 client not initialized")
+        })?;
+
+        debug!("Listing objects in bucket: {}", self.config.bucket);
+        let mut request = client
+            .list_objects_v2()
+            .bucket(&self.config.bucket);
+
+        if !self.config.prefix.is_empty() {
+            debug!("Using prefix filter: {}", self.config.prefix);
+            request = request.prefix(&self.config.prefix);
+        }
+
+        let objects = match request.send().await
+        {
+            Ok(objects) => objects,
+            Err(e) => {
+                error!("Failed to list objects in bucket {}: {}", self.config.bucket, e);
+                warn!("Please verify your S3 settings and try again");
+                self.set_error(Some(format!("Error: Failed to list objects in bucket: {}", e)));
+                return Err(anyhow!("Failed to list objects in bucket: {}", e));
+            }
+        };
 
         if let Some(contents) = objects.contents {
             self.snapshots = contents
@@ -192,6 +274,7 @@ impl SnapshotBrowser {
 pub async fn run_tui(
     bucket: Option<String>,
     region: Option<String>,
+    prefix: Option<String>,
     endpoint_url: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
@@ -203,7 +286,15 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut browser = SnapshotBrowser::new(bucket, region, endpoint_url, access_key_id, secret_access_key, path_style);
+    let mut browser = SnapshotBrowser::new(
+        bucket,
+        region,
+        prefix,
+        endpoint_url,
+        access_key_id,
+        secret_access_key,
+        path_style,
+    );
     browser.load_snapshots().await?;
 
     let result = run_app(&mut terminal, browser).await;
@@ -255,7 +346,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                     KeyCode::Tab => {
                         browser.focus = match browser.focus {
                             FocusField::Bucket => FocusField::Region,
-                            FocusField::Region => FocusField::EndpointUrl,
+                            FocusField::Region => FocusField::Prefix,
+                            FocusField::Prefix => FocusField::EndpointUrl,
                             FocusField::EndpointUrl => FocusField::AccessKeyId,
                             FocusField::AccessKeyId => FocusField::SecretAccessKey,
                             FocusField::SecretAccessKey => FocusField::PathStyle,
@@ -280,15 +372,20 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                     KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => browser.next(),
                     KeyCode::Up | KeyCode::Char('k') if browser.focus == FocusField::SnapshotList => browser.previous(),
                     KeyCode::Char('r') => {
-                        browser.load_snapshots().await?
+                        if let Err(e) = browser.load_snapshots().await {
+                            error!("Failed to list snapshots: {}", e);
+                        }
                     }
                     _ => {}
                 },
                 InputMode::Editing => match key.code {
                     KeyCode::Enter => {
+                        debug!("Enter key pressed, attempting to initialize S3 client");
+                        browser.input_mode = InputMode::Normal;
                         match browser.focus {
                             FocusField::Bucket => browser.config.bucket = browser.input_buffer.clone(),
                             FocusField::Region => browser.config.region = browser.input_buffer.clone(),
+                            FocusField::Prefix => browser.config.prefix = browser.input_buffer.clone(),
                             FocusField::EndpointUrl => {
                                 browser.config.endpoint_url = if browser.input_buffer.is_empty() {
                                     None
@@ -315,8 +412,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                             }
                             _ => {}
                         }
-                        browser.input_mode = InputMode::Normal;
-                        browser.load_snapshots().await?
+                        if let Err(e) = browser.load_snapshots().await {
+                            error!("Failed to list snapshots: {}", e);
+                        }
                     }
                     KeyCode::Esc => {
                         browser.input_mode = InputMode::Normal;
@@ -340,11 +438,19 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         .margin(1)
         .constraints([
             Constraint::Length(3),   // Title
-            Constraint::Length(15),  // Config
-            Constraint::Min(1),      // Snapshots
-            Constraint::Length(3),   // Help
+            Constraint::Ratio(2, 10),  // Config (20%)
+            Constraint::Min(10),     // Snapshots (remaining space)
         ])
         .split(f.size());
+
+    // Split the snapshots area into list and help sections
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),      // Snapshots list
+            Constraint::Length(3),   // Help text
+        ])
+        .split(chunks[2]);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled("PostgreSQL S3 Snapshots", Style::default().add_modifier(Modifier::BOLD)),
@@ -357,17 +463,51 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         .title("Configuration")
         .borders(Borders::ALL);
     let config_inner = Layout::default()
-        .direction(Direction::Vertical)
+        .direction(Direction::Horizontal)
         .margin(1)
+        .constraints([
+            Constraint::Ratio(1, 2),  // Left column
+            Constraint::Ratio(1, 2),  // Right column
+        ])
+        .split(chunks[1]);
+
+    let left_column = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // Bucket
             Constraint::Length(1),  // Region
+            Constraint::Length(1),  // Prefix
             Constraint::Length(1),  // Endpoint
+        ])
+        .split(config_inner[0]);
+
+    let right_column = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
             Constraint::Length(1),  // Access Key
             Constraint::Length(1),  // Secret Key
             Constraint::Length(1),  // Path Style
+            Constraint::Length(1),  // Empty
         ])
-        .split(chunks[1]);
+        .split(config_inner[1]);
+
+    let prefix_style = if browser.focus == FocusField::Prefix {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+
+    let prefix_line = Line::from(vec![
+        Span::raw("Prefix: "),
+        Span::styled(
+            if browser.focus == FocusField::Prefix && browser.input_mode == InputMode::Editing {
+                &browser.input_buffer
+            } else {
+                &browser.config.prefix
+            },
+            prefix_style,
+        ),
+    ]);
 
     let bucket_style = if browser.focus == FocusField::Bucket {
         Style::default().fg(Color::Yellow)
@@ -443,12 +583,13 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         ),
     ]);
 
-    f.render_widget(Paragraph::new(bucket_line), config_inner[0]);
-    f.render_widget(Paragraph::new(region_line), config_inner[1]);
-    f.render_widget(Paragraph::new(endpoint_line), config_inner[2]);
-    f.render_widget(Paragraph::new(access_key_line), config_inner[3]);
-    f.render_widget(Paragraph::new(secret_key_line), config_inner[4]);
-    f.render_widget(Paragraph::new(path_style_line), config_inner[5]);
+    f.render_widget(Paragraph::new(bucket_line), left_column[0]);
+    f.render_widget(Paragraph::new(region_line), left_column[1]);
+    f.render_widget(Paragraph::new(prefix_line), left_column[2]);
+    f.render_widget(Paragraph::new(endpoint_line), left_column[3]);
+    f.render_widget(Paragraph::new(access_key_line), right_column[0]);
+    f.render_widget(Paragraph::new(secret_key_line), right_column[1]);
+    f.render_widget(Paragraph::new(path_style_line), right_column[2]);
     f.render_widget(config_block, chunks[1]);
 
     // Input mode
@@ -483,14 +624,29 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         .map(|s| ListItem::new(s.as_str()))
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().title("Snapshots").borders(Borders::ALL))
-        .highlight_style(Style::default().bg(Color::DarkGray))
-        .highlight_symbol(">");
+    let snapshots_block = Block::default()
+        .title("Snapshots")
+        .borders(Borders::ALL);
 
-    f.render_stateful_widget(list, chunks[1], &mut browser.state);
+    let snapshots_list = List::new(items)
+        .style(Style::default().fg(Color::White))
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol(">> ");
+
+    let inner = snapshots_block.inner(list_chunks[0]);
+    f.render_widget(snapshots_block, list_chunks[0]);
+    f.render_stateful_widget(snapshots_list, inner, &mut browser.state);
 
     let help = Paragraph::new("↑/↓: Navigate • Enter: Select • q: Quit")
         .block(Block::default().borders(Borders::ALL));
-    f.render_widget(help, chunks[2]);
+    f.render_widget(help, list_chunks[1]);
+
+    if let Some(error) = &browser.config.error_message {
+        let error_block = Block::default()
+            .title("Error")
+            .borders(Borders::ALL);
+        let error_paragraph = Paragraph::new(error.as_str())
+            .block(error_block);
+        f.render_widget(error_paragraph, chunks[3]);
+    }
 }
