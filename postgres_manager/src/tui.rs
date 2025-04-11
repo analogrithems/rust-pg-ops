@@ -67,8 +67,7 @@ pub enum FocusField {
     SnapshotList,
 }
 
-use aws_sdk_s3::primitives::DateTime;
-use chrono::{DateTime as ChronoDateTime, NaiveDateTime, Utc};
+use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 use log::info;
 use humansize::{format_size, BINARY};
 
@@ -76,13 +75,16 @@ use humansize::{format_size, BINARY};
 pub struct BackupMetadata {
     pub key: String,
     pub size: i64,
-    pub last_modified: DateTime,
+    pub last_modified: AwsDateTime,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PopupState {
     Hidden,
     ConfirmRestore,
+    Downloading(f32),  // Added state for download progress (0.0 to 1.0)
+    Error(String),
+    Success(String),
     TestS3Result(String),
     TestPgResult(String),
 }
@@ -97,13 +99,19 @@ pub struct SnapshotBrowser {
     pub focus: FocusField,
     pub input_mode: InputMode,
     pub input_buffer: String,
+    pub temp_file: Option<String>,  // Added to store temporary file path
 }
+
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+
+use tempfile::Builder;
 
 impl SnapshotBrowser {
     pub async fn test_s3_connection(&mut self) -> Result<()> {
         if self.s3_client.is_none() {
             if let Err(e) = self.init_s3_client().await {
-                self.popup_state = PopupState::TestS3Result(format!("S3 connection failed: {}", e));
+                self.popup_state = PopupState::Error(format!("S3 connection failed: {}", e));
                 return Ok(());
             }
         }
@@ -158,6 +166,7 @@ impl SnapshotBrowser {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             popup_state: PopupState::Hidden,
+            temp_file: None,
         }
     }
 
@@ -412,13 +421,13 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::EndpointUrl | FocusField::AccessKeyId |
                             FocusField::SecretAccessKey | FocusField::PathStyle => {
                                 if let Err(e) = browser.test_s3_connection().await {
-                                    browser.popup_state = PopupState::TestS3Result(format!("Error: {}", e));
+                                    browser.popup_state = PopupState::Error(format!("Error: {}", e));
                                 }
                             }
                             FocusField::PgHost | FocusField::PgPort | FocusField::PgUsername |
                             FocusField::PgPassword | FocusField::PgSsl | FocusField::PgDbName => {
                                 if let Err(e) = browser.test_pg_connection().await {
-                                    browser.popup_state = PopupState::TestPgResult(format!("Error: {}", e));
+                                    browser.popup_state = PopupState::Error(format!("Error: {}", e));
                                 }
                             }
                             _ => {}
@@ -480,15 +489,6 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                     KeyCode::Char('E') => browser.focus = FocusField::EndpointUrl,
                     KeyCode::Char('a') => browser.focus = FocusField::AccessKeyId,
                     KeyCode::Char('s') => browser.focus = FocusField::SecretAccessKey,
-                    KeyCode::Char('y') => {
-                        if browser.popup_state == PopupState::ConfirmRestore {
-                            if let Some(snapshot) = browser.selected_snapshot() {
-                                return Ok(Some(snapshot.key.clone()));
-                            }
-                        } else {
-                            browser.focus = FocusField::PathStyle;
-                        }
-                    },
                     // PostgreSQL Settings shortcuts (a-h)
                     KeyCode::Char('h') => browser.focus = FocusField::PgHost,
                     KeyCode::Char('p') => browser.focus = FocusField::PgPort,
@@ -537,7 +537,66 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             _ => String::new(),
                         };
                     },
-                    _ => {},
+                    KeyCode::Char('y') => {
+                        if browser.popup_state == PopupState::ConfirmRestore {
+                            if let Some(snapshot) = browser.selected_snapshot().cloned() {
+                                // Create a temporary file
+                                let temp_dir = Builder::new().prefix("pg-backup-").tempdir()?;
+                                let temp_path = temp_dir.path().join("backup.sql");
+                                let temp_path_str = temp_path.to_string_lossy().to_string();
+
+                                // Start download
+                                browser.popup_state = PopupState::Downloading(0.0);
+
+                                // Begin downloading the file
+                                if let Some(client) = &browser.s3_client {
+                                    let get_obj = client.get_object()
+                                        .bucket(&browser.config.bucket)
+                                        .key(&snapshot.key)
+                                        .send()
+                                        .await;
+
+                                    match get_obj {
+                                        Ok(resp) => {
+                                            if let Some(total_size) = resp.content_length() {
+                                                let mut file = File::create(&temp_path).await?;
+                                                let mut stream = resp.body;
+                                                let mut downloaded: u64 = 0;
+
+                                                while let Some(chunk) = stream.try_next().await? {
+                                                    file.write_all(&chunk).await?;
+                                                    downloaded += chunk.len() as u64;
+                                                    let progress = downloaded as f32 / total_size as f32;
+                                                    browser.popup_state = PopupState::Downloading(progress);
+                                                    // Force a redraw to show progress
+                                                    terminal.draw(|f| ui(f, &mut browser))?;
+                                                    // Small delay to allow UI updates
+                                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                }
+                                                browser.temp_file = Some(temp_path_str.clone());
+                                                browser.popup_state = PopupState::Success("Download complete".to_string());
+                                                // Show success message briefly
+                                                terminal.draw(|f| ui(f, &mut browser))?;
+                                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                                return Ok(Some(temp_path_str));
+                                            } else {
+                                                browser.popup_state = PopupState::Error("Could not determine file size".to_string());
+                                                return Ok(None);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            browser.popup_state = PopupState::Error(format!("Failed to download backup: {}", e));
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                                browser.popup_state = PopupState::Error("S3 client not initialized".to_string());
+                                return Ok(None);
+                            }
+                            return Ok(None);
+                        }
+                    }
+                    _ => {}
                 },
                 InputMode::Editing => match key.code {
                     KeyCode::Enter => {
@@ -941,10 +1000,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
             } else {
                 Style::default()
             };
-            let timestamp = snapshot.last_modified.as_secs_f64() as i64;
-            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
-            let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
-            let date = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+            let date = snapshot.last_modified.secs().to_string();
             let size = format_size(snapshot.size as u64, BINARY);
             let content = format!("{:<60} {} {}", snapshot.key, date, size);
             ListItem::new(content).style(style)
@@ -970,7 +1026,26 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
 
     // Draw popups if active
     match &browser.popup_state {
+        PopupState::Hidden => {}
+        PopupState::Error(msg) => {
+            let area = centered_rect(60, 5, f.size());
+            f.render_widget(Clear, area);
+            let popup = Paragraph::new(vec![Line::from(msg.as_str())])
+                .block(Block::default().title("Error").borders(Borders::ALL))
+                .alignment(Alignment::Center);
+            f.render_widget(popup, area);
+        }
+        PopupState::Success(msg) => {
+            let area = centered_rect(60, 5, f.size());
+            f.render_widget(Clear, area);
+            let popup = Paragraph::new(vec![Line::from(msg.as_str())])
+                .block(Block::default().title("Success").borders(Borders::ALL))
+                .alignment(Alignment::Center);
+            f.render_widget(popup, area);
+        }
         PopupState::ConfirmRestore => {
+            let area = centered_rect(60, 8, f.size());
+            f.render_widget(Clear, area);
             if let Some(snapshot) = browser.selected_snapshot() {
                 let popup_block = Block::default()
                     .title("Confirm Restore")
@@ -988,10 +1063,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
                     )]),
                     Line::from(vec![Span::raw("Date: "), Span::styled(
                         {
-                            let timestamp = snapshot.last_modified.as_secs_f64() as i64;
-                            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
-                            let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
-                            datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                            snapshot.last_modified.secs().to_string()
                         },
                         Style::default().add_modifier(Modifier::BOLD),
                     )]),
@@ -1005,8 +1077,24 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
                 .block(popup_block)
                 .alignment(Alignment::Center);
 
-                f.render_widget(popup, area);
+                f.render_widget(popup.block(Block::default().title("Confirm Restore").borders(Borders::ALL)), area);
             }
+        }
+        PopupState::Downloading(progress) => {
+            let area = centered_rect(60, 5, f.size());
+            f.render_widget(Clear, area);
+            let popup = Paragraph::new(vec![
+                Line::from(vec![Span::raw("Downloading snapshot...")]),
+                Line::from(vec![Span::raw("")]),
+                Line::from(vec![Span::raw(format!("[{}>{} ]",
+                    "=".repeat((progress * 50.0) as usize),
+                    " ".repeat((50.0 - progress * 50.0) as usize)
+                ))]),
+                Line::from(vec![Span::raw(format!("{}%", (progress * 100.0) as u32))]),
+            ])
+            .block(Block::default().title("Download Progress").borders(Borders::ALL))
+            .alignment(Alignment::Center);
+            f.render_widget(popup, area);
         }
         PopupState::TestS3Result(result) => {
             let area = centered_rect(60, 5, f.size());
@@ -1042,7 +1130,6 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
             .alignment(Alignment::Center);
             f.render_widget(popup, area);
         }
-        PopupState::Hidden => {}
     }
 
     if let Some(error) = &browser.config.error_message {
