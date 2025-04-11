@@ -85,14 +85,6 @@ pub enum PopupState {
     ConfirmRestore,
     TestS3Result(String),
     TestPgResult(String),
-    Downloading {
-        progress: f64,
-        total_size: u64,
-        tmp_path: String,
-    },
-    DownloadComplete {
-        tmp_path: String,
-    },
 }
 
 pub struct SnapshotBrowser {
@@ -329,68 +321,11 @@ impl SnapshotBrowser {
     }
 
     pub fn selected_snapshot(&self) -> Option<&BackupMetadata> {
-        if self.snapshots.is_empty() {
-            None
-        } else {
-            self.state.selected().map(|i| &self.snapshots[i])
-        }
+        self.state
+            .selected()
+            .and_then(|i| self.snapshots.get(i))
     }
-
-    pub async fn download_snapshot(&mut self, snapshot: &BackupMetadata) -> Result<String> {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-        use tokio::io::AsyncReadExt;
-
-        let tmp_file = NamedTempFile::new()?;
-        let tmp_path = tmp_file.path().to_string_lossy().to_string();
-        let total_size = snapshot.size as u64;
-
-        // Start the download
-        self.popup_state = PopupState::Downloading {
-            progress: 0.0,
-            total_size,
-            tmp_path: tmp_path.clone(),
-        };
-
-        let mut stream = self.s3_client.as_ref().unwrap()
-            .get_object()
-            .bucket(&self.config.bucket)
-            .key(&snapshot.key)
-            .send()
-            .await?
-            .body
-            .into_async_read();
-
-        let mut downloaded = 0;
-        let mut buffer = vec![0u8; 8192];
-        let mut file = tmp_file.as_file();
-
-        loop {
-            let n = stream.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buffer[..n])?;
-            downloaded += n;
-            
-            // Update progress
-            self.popup_state = PopupState::Downloading {
-                progress: (downloaded as f64 / total_size as f64) * 100.0,
-                total_size,
-                tmp_path: tmp_path.clone(),
-            };
-        }
-
-        // Keep the file from being deleted when tmp_file is dropped
-        tmp_file.keep()?;
-
-        // Show completion popup
-        self.popup_state = PopupState::DownloadComplete {
-            tmp_path: tmp_path.clone(),
-        };
-
-        Ok(tmp_path)
-    }
+}
 
 #[allow(dead_code)]
 pub async fn run_tui(
@@ -471,14 +406,6 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
             match browser.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => return Ok(None),
-                    KeyCode::Char('d') => {
-                        if let Some(snapshot) = browser.selected_snapshot() {
-                            if let Err(e) = browser.download_snapshot(snapshot).await {
-                                error!("Failed to download snapshot: {}", e);
-                                browser.popup_state = PopupState::TestS3Result(format!("Failed to download: {}", e));
-                            }
-                        }
-                    },
                     KeyCode::Char('t') => {
                         match browser.focus {
                             FocusField::Bucket | FocusField::Region | FocusField::Prefix |
@@ -688,11 +615,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
             }
         }
     }
+}
 
-pub fn render_ui<B: Backend>(f: &mut Frame<B>, browser: &mut SnapshotBrowser) {
-    use ratatui::style::Alignment;
-    use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
-    use ratatui::text::{Line, Span};
+fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -1017,7 +942,7 @@ pub fn render_ui<B: Backend>(f: &mut Frame<B>, browser: &mut SnapshotBrowser) {
                 Style::default()
             };
             let timestamp = snapshot.last_modified.as_secs_f64() as i64;
-            let naive = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
+            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
             let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
             let date = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
             let size = format_size(snapshot.size as u64, BINARY);
@@ -1032,47 +957,57 @@ pub fn render_ui<B: Backend>(f: &mut Frame<B>, browser: &mut SnapshotBrowser) {
     let inner = snapshots_block.inner(list_chunks[0]);
     f.render_widget(&snapshots_block, chunks[3]);
 
-    let snapshots_list = if items.is_empty() {
-        List::new(vec![ListItem::new("No snapshots found in bucket. Press 't' to test S3 connection.")])
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default())
-    } else {
-        List::new(items)
-            .style(Style::default().fg(Color::White))
-            .block(Block::default())
-            .highlight_symbol(">> ")
-    };
+    let snapshots_list = List::new(items)
+        .style(Style::default().fg(Color::White))
+        .block(Block::default())
+        .highlight_symbol(">> ");
 
     f.render_stateful_widget(snapshots_list, inner, &mut browser.state);
 
-    if let Some(snapshot) = browser.selected_snapshot() {
-        let popup = Paragraph::new(vec![
-            Line::from(vec![Span::raw("Key: "), Span::styled(
-                snapshot.key.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::raw("Date: "), Span::styled(
-                {
-                    let timestamp = snapshot.last_modified.as_secs_f64() as i64;
-                    let naive = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
-                    let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
-                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-                },
-                Style::default().add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::raw("Size: "), Span::styled(
-                format_size(snapshot.size as u64, BINARY),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![]),
-            Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to cancel")]),
-        ])
-        .block(popup_block)
-        .alignment(Alignment::Center);
+    let help = Paragraph::new("↑/↓: Navigate • Enter: Select • t: Test Connection • q: Quit")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(help, list_chunks[1]);
 
-        f.render_widget(popup, area);
-    }
-},
+    // Draw popups if active
+    match &browser.popup_state {
+        PopupState::ConfirmRestore => {
+            if let Some(snapshot) = browser.selected_snapshot() {
+                let popup_block = Block::default()
+                    .title("Confirm Restore")
+                    .borders(Borders::ALL);
+
+                let area = centered_rect(60, 10, f.size());
+                f.render_widget(Clear, area); // Clear the background
+
+                let popup = Paragraph::new(vec![
+                    Line::from(vec![Span::raw("Are you sure you want to restore this backup?")]),
+                    Line::from(vec![]),
+                    Line::from(vec![Span::raw("File: "), Span::styled(
+                        &snapshot.key,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![Span::raw("Date: "), Span::styled(
+                        {
+                            let timestamp = snapshot.last_modified.as_secs_f64() as i64;
+                            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
+                            let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
+                            datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                        },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![Span::raw("Size: "), Span::styled(
+                        format_size(snapshot.size as u64, BINARY),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![]),
+                    Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to cancel")]),
+                ])
+                .block(popup_block)
+                .alignment(Alignment::Center);
+
+                f.render_widget(popup, area);
+            }
+        }
         PopupState::TestS3Result(result) => {
             let area = centered_rect(60, 5, f.size());
             f.render_widget(Clear, area);
@@ -1094,18 +1029,22 @@ pub fn render_ui<B: Backend>(f: &mut Frame<B>, browser: &mut SnapshotBrowser) {
             let area = centered_rect(60, 5, f.size());
             f.render_widget(Clear, area);
             let popup = Paragraph::new(vec![
-                Line::from(vec![Span::raw(result)]),
+                Line::from(vec![Span::raw("PostgreSQL Connection Test")]),
                 Line::from(vec![]),
-                Line::from(vec![Span::raw("Press Esc to dismiss")])
+                Line::from(vec![Span::styled(
+                    result,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![]),
+                Line::from(vec![Span::raw("Press Esc to dismiss")]),
             ])
-            .alignment(Alignment::Center)
-            .block(Block::default().title("PostgreSQL Connection Test").borders(Borders::ALL));
+            .block(Block::default().title("Test Result").borders(Borders::ALL))
+            .alignment(Alignment::Center);
             f.render_widget(popup, area);
-        },
-        PopupState::Hidden => {},
+        }
+        PopupState::Hidden => {}
     }
 
-    // Display error message if any
     if let Some(error) = &browser.config.error_message {
         let error_block = Block::default()
             .title("Error")
@@ -1114,5 +1053,4 @@ pub fn render_ui<B: Backend>(f: &mut Frame<B>, browser: &mut SnapshotBrowser) {
             .block(error_block);
         f.render_widget(error_paragraph, chunks[3]);
     }
-}
 }
