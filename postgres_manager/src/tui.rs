@@ -16,8 +16,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-
-
+use crate::{connect_ssl, connect_no_ssl};
 
 #[derive(Debug, Default)]
 pub struct S3Config {
@@ -84,6 +83,8 @@ pub struct BackupMetadata {
 pub enum PopupState {
     Hidden,
     ConfirmRestore,
+    TestS3Result(String),
+    TestPgResult(String),
 }
 
 pub struct SnapshotBrowser {
@@ -99,6 +100,53 @@ pub struct SnapshotBrowser {
 }
 
 impl SnapshotBrowser {
+    pub async fn test_s3_connection(&mut self) -> Result<()> {
+        if self.s3_client.is_none() {
+            if let Err(e) = self.init_s3_client().await {
+                self.popup_state = PopupState::TestS3Result(format!("S3 connection failed: {}", e));
+                return Ok(());
+            }
+        }
+
+        let test_result = match self.s3_client.as_ref().unwrap()
+            .list_objects_v2()
+            .bucket(&self.config.bucket)
+            .prefix("test-connection")
+            .send()
+            .await {
+            Ok(_) => "S3 connection successful!".to_string(),
+            Err(e) => format!("S3 connection failed: {}", e),
+        };
+        self.popup_state = PopupState::TestS3Result(test_result);
+        Ok(())
+    }
+
+    pub async fn test_pg_connection(&mut self) -> Result<()> {
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config.host(self.pg_config.host.as_deref().unwrap_or("localhost"))
+            .port(self.pg_config.port.unwrap_or(5432))
+            .user(self.pg_config.username.as_deref().unwrap_or(""))
+            .password(self.pg_config.password.as_deref().unwrap_or(""))
+            .dbname(self.pg_config.db_name.as_deref().unwrap_or("postgres"));
+
+        let connect_result = if self.pg_config.use_ssl {
+            // For now, we'll accept invalid certs in test mode
+            // In a production environment, you'd want to verify certs
+            connect_ssl(&pg_config, false, None).await
+        } else {
+            connect_no_ssl(&pg_config).await
+        };
+
+        match connect_result {
+            Ok(_) => {
+                self.popup_state = PopupState::TestPgResult("PostgreSQL connection successful!".to_string());
+            }
+            Err(e) => {
+                self.popup_state = PopupState::TestPgResult(format!("PostgreSQL connection failed: {}", e));
+            }
+        }
+        Ok(())
+    }
     pub fn new(config: S3Config, pg_config: PostgresConfig) -> Self {
         Self {
             config,
@@ -175,39 +223,13 @@ impl SnapshotBrowser {
         Ok(())
     }
 
-    pub async fn test_s3_connection(&mut self) -> Result<()> {
-        debug!("Testing S3 connection");
-        match self.s3_client.as_ref() {
-            Some(client) => {
-                match client.list_buckets().send().await {
-                    Ok(_) => {
-                        debug!("Successfully connected to S3");
-                        self.set_error(None);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to S3: {}", e);
-                        self.set_error(Some(format!("Error: Failed to connect to S3: {}", e)));
-                        Err(anyhow!("Failed to connect to S3: {}", e))
-                    }
-                }
-            }
-            None => {
-                error!("S3 client not initialized");
-                Err(anyhow!("S3 client not initialized"))
-            }
-        }
-    }
+
 
     pub async fn load_snapshots(&mut self) -> Result<()> {
         debug!("Loading snapshots from bucket: {}", self.config.bucket);
         if self.s3_client.is_none() {
             if let Err(e) = self.init_s3_client().await {
                 error!("Failed to initialize S3 client: {}", e);
-                return Err(e);
-            }
-            if let Err(e) = self.test_s3_connection().await {
-                error!("Failed to connect to S3: {}", e);
                 return Err(e);
             }
         }
@@ -257,10 +279,13 @@ impl SnapshotBrowser {
                 })
                 .collect();
             debug!("Found {} snapshots in bucket", self.snapshots.len());
-            self.snapshots.sort_by(|a, b| b.last_modified.cmp(&a.last_modified)); // Sort newest first
+            self.snapshots.sort_by(|a, b| a.key.cmp(&b.key)); // Sort alphabetically
         }
 
-        if !self.snapshots.is_empty() {
+        if self.snapshots.is_empty() {
+            self.set_error(Some(format!("No snapshots found in bucket '{}'", self.config.bucket)));
+        } else {
+            self.set_error(None);
             self.state.select(Some(0));
         }
 
@@ -381,6 +406,24 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
             match browser.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => return Ok(None),
+                    KeyCode::Char('t') => {
+                        match browser.focus {
+                            FocusField::Bucket | FocusField::Region | FocusField::Prefix |
+                            FocusField::EndpointUrl | FocusField::AccessKeyId |
+                            FocusField::SecretAccessKey | FocusField::PathStyle => {
+                                if let Err(e) = browser.test_s3_connection().await {
+                                    browser.popup_state = PopupState::TestS3Result(format!("Error: {}", e));
+                                }
+                            }
+                            FocusField::PgHost | FocusField::PgPort | FocusField::PgUsername |
+                            FocusField::PgPassword | FocusField::PgSsl | FocusField::PgDbName => {
+                                if let Err(e) = browser.test_pg_connection().await {
+                                    browser.popup_state = PopupState::TestPgResult(format!("Error: {}", e));
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
                     KeyCode::Enter => {
                         if browser.focus == FocusField::SnapshotList {
                             if browser.selected_snapshot().is_some() {
@@ -457,6 +500,14 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             browser.popup_state = PopupState::Hidden;
                         } else {
                             browser.focus = FocusField::PgDbName;
+                        }
+                    },
+                    KeyCode::Esc => {
+                        match browser.popup_state {
+                            PopupState::TestS3Result(_) | PopupState::TestPgResult(_) | PopupState::ConfirmRestore => {
+                                browser.popup_state = PopupState::Hidden;
+                            },
+                            _ => {}
                         }
                     },
                     KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => browser.next(),
@@ -913,48 +964,85 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
 
     f.render_stateful_widget(snapshots_list, inner, &mut browser.state);
 
-    let help = Paragraph::new("↑/↓: Navigate • Enter: Select • q: Quit")
+    let help = Paragraph::new("↑/↓: Navigate • Enter: Select • t: Test Connection • q: Quit")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(help, list_chunks[1]);
 
-    // Draw confirmation popup if active
-    if browser.popup_state == PopupState::ConfirmRestore {
-        if let Some(snapshot) = browser.selected_snapshot() {
-            let popup_block = Block::default()
-                .title("Confirm Restore")
-                .borders(Borders::ALL);
+    // Draw popups if active
+    match &browser.popup_state {
+        PopupState::ConfirmRestore => {
+            if let Some(snapshot) = browser.selected_snapshot() {
+                let popup_block = Block::default()
+                    .title("Confirm Restore")
+                    .borders(Borders::ALL);
 
-            let area = centered_rect(60, 20, f.size());
-            f.render_widget(Clear, area); // Clear the background
-            
+                let area = centered_rect(60, 10, f.size());
+                f.render_widget(Clear, area); // Clear the background
+
+                let popup = Paragraph::new(vec![
+                    Line::from(vec![Span::raw("Are you sure you want to restore this backup?")]),
+                    Line::from(vec![]),
+                    Line::from(vec![Span::raw("File: "), Span::styled(
+                        &snapshot.key,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![Span::raw("Date: "), Span::styled(
+                        {
+                            let timestamp = snapshot.last_modified.as_secs_f64() as i64;
+                            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
+                            let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
+                            datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                        },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![Span::raw("Size: "), Span::styled(
+                        format_size(snapshot.size as u64, BINARY),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![]),
+                    Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to cancel")]),
+                ])
+                .block(popup_block)
+                .alignment(Alignment::Center);
+
+                f.render_widget(popup, area);
+            }
+        }
+        PopupState::TestS3Result(result) => {
+            let area = centered_rect(60, 5, f.size());
+            f.render_widget(Clear, area);
             let popup = Paragraph::new(vec![
-                Line::from(vec![Span::raw("Are you sure you want to restore this backup?")]),
+                Line::from(vec![Span::raw("S3 Connection Test")]),
                 Line::from(vec![]),
-                Line::from(vec![Span::raw("File: "), Span::styled(
-                    &snapshot.key,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(vec![Span::raw("Date: "), Span::styled(
-                    {
-                        let timestamp = snapshot.last_modified.as_secs_f64() as i64;
-                        let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
-                        let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
-                        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-                    },
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(vec![Span::raw("Size: "), Span::styled(
-                    format_size(snapshot.size as u64, BINARY),
+                Line::from(vec![Span::styled(
+                    result,
                     Style::default().add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(vec![]),
-                Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to cancel")]),
+                Line::from(vec![Span::raw("Press Esc to dismiss")]),
             ])
-            .alignment(Alignment::Center)
-            .block(popup_block);
-
+            .block(Block::default().title("Test Result").borders(Borders::ALL))
+            .alignment(Alignment::Center);
             f.render_widget(popup, area);
         }
+        PopupState::TestPgResult(result) => {
+            let area = centered_rect(60, 5, f.size());
+            f.render_widget(Clear, area);
+            let popup = Paragraph::new(vec![
+                Line::from(vec![Span::raw("PostgreSQL Connection Test")]),
+                Line::from(vec![]),
+                Line::from(vec![Span::styled(
+                    result,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![]),
+                Line::from(vec![Span::raw("Press Esc to dismiss")]),
+            ])
+            .block(Block::default().title("Test Result").borders(Borders::ALL))
+            .alignment(Alignment::Center);
+            f.render_widget(popup, area);
+        }
+        PopupState::Hidden => {}
     }
 
     if let Some(error) = &browser.config.error_message {

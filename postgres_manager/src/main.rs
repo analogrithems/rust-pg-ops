@@ -32,7 +32,7 @@ struct Cli {
     #[arg(short = 'H', long)]
     host: Option<String>,
 
-    #[arg(short, long)]
+    #[arg(short, default_value = "5432", long)]
     port: Option<u16>,
 
     #[arg(short, long)]
@@ -40,6 +40,9 @@ struct Cli {
 
     #[arg(short = 'P', long)]
     password: Option<String>,
+
+    #[arg(short = 'D', default_value = "postgres", long)]
+    db_name: Option<String>,
 
     #[arg(long, default_value = "true", help = "Enable SSL for the connection")]
     use_ssl: bool,
@@ -351,7 +354,7 @@ async fn main() -> Result<()> {
                     username: cli.username.clone(),
                     password: cli.password.clone(),
                     use_ssl: cli.use_ssl,
-                    db_name: None,
+                    db_name: cli.db_name.clone(),
                 },
             );
 
