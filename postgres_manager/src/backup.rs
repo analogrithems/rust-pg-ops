@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::process::Command;
+use log::{debug, error};
 
 pub async fn dump_database(
     name: &str,
@@ -7,7 +8,16 @@ pub async fn dump_database(
     host: &str,
     port: u16,
     username: Option<&str>,
+    password: Option<&str>,
+    ssl: bool,
 ) -> Result<()> {
+
+    // Add PGSSLMODE environment variable if SSL is enabled
+    if ssl {
+        std::env::set_var("PGSSLMODE", "require");
+    }
+
+    debug!("Building pg_dump command");
     let mut cmd = Command::new("pg_dump");
     cmd.arg("--dbname").arg(name)
         .arg("--file").arg(output)
@@ -18,12 +28,19 @@ pub async fn dump_database(
         cmd.arg("--username").arg(user);
     }
 
-    let status = cmd
-        .status()
+    if let Some(pass) = password {
+        cmd.arg("--password").arg(pass);
+    }
+
+    debug!("Executing pg_dump command");
+    let output = cmd
+        .output()
         .context("Failed to execute pg_dump")?;
 
-    if !status.success() {
-        anyhow::bail!("pg_dump failed with status: {}", status);
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        error!("pg_dump failed: {}", error_msg);
+        anyhow::bail!("pg_dump failed: {}", error_msg);
     }
 
     Ok(())
@@ -35,23 +52,38 @@ pub async fn restore_database(
     host: &str,
     port: u16,
     username: Option<&str>,
+    password: Option<&str>,
+    ssl: bool,
 ) -> Result<()> {
+    // Add PGSSLMODE environment variable if SSL is enabled
+    if ssl {
+        std::env::set_var("PGSSLMODE", "require");
+    }
+
+    debug!("Building pg_restore command");
     let mut cmd = Command::new("pg_restore");
     cmd.arg("--dbname").arg(name)
         .arg("--host").arg(host)
-        .arg("--port").arg(port.to_string())
-        .arg(input);
+        .arg("--file").arg(input)
+        .arg("--port").arg(port.to_string());
 
     if let Some(user) = username {
         cmd.arg("--username").arg(user);
     }
 
-    let status = cmd
-        .status()
+    if let Some(pass) = password {
+        cmd.arg("--password").arg(pass);
+    }
+
+    debug!("Executing pg_restore command");
+    let output = cmd
+        .output()
         .context("Failed to execute pg_restore")?;
 
-    if !status.success() {
-        anyhow::bail!("pg_restore failed with status: {}", status);
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        error!("pg_restore failed: {}", error_msg);
+        anyhow::bail!("pg_restore failed: {}", error_msg);
     }
 
     Ok(())
