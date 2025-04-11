@@ -1,19 +1,26 @@
 mod backup;
 mod tui;
 
-use anyhow::{anyhow, Context, Result};
-use aws_sdk_s3::Client as S3Client;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, command, arg};
+
+use tokio_postgres::Config as PgConfig;
+use tokio_postgres::config::SslMode;
+use log::{error, info, warn, LevelFilter};
+use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
+use crate::tui::{SnapshotBrowser, S3Config, PostgresConfig};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio_postgres::Config as PgConfig;
-use log::{debug, error, info, LevelFilter};
-use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
+use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
+use std::io;
 
 #[derive(Parser)]
-#[command(name = "pgman")]
+#[command(name = "postgres_manager")]
 #[command(about = "PostgreSQL database management tool")]
 struct Cli {
     #[command(subcommand)]
@@ -22,11 +29,11 @@ struct Cli {
     #[arg(short, long)]
     file: Option<String>,
 
-    #[arg(short = 'H', long, default_value = "localhost")]
-    host: String,
+    #[arg(short = 'H', long)]
+    host: Option<String>,
 
-    #[arg(short, long, default_value = "5432")]
-    port: u16,
+    #[arg(short, long)]
+    port: Option<u16>,
 
     #[arg(short, long)]
     username: Option<String>,
@@ -42,6 +49,27 @@ struct Cli {
 
     #[arg(long, default_value = "false", help = "Verify SSL certificates")]
     verify_ssl: bool,
+
+    #[arg(short = 'B', long, help = "S3 bucket name")]
+    bucket: Option<String>,
+
+    #[arg(short = 'R', long, help = "AWS region")]
+    region: Option<String>,
+
+    #[arg(short = 'x', long, default_value = "postgres", help = "Prefix for snapshot keys")]
+    prefix: Option<String>,
+
+    #[arg(short = 'E', long, help = "Custom endpoint URL for S3")]
+    endpoint_url: Option<String>,
+
+    #[arg(short = 'A', long, help = "AWS access key ID")]
+    access_key_id: Option<String>,
+
+    #[arg(short = 'S', long, help = "AWS secret access key")]
+    secret_access_key: Option<String>,
+
+    #[arg(long, default_value = "true", help = "Force path-style access to S3")]
+    path_style: bool,
 }
 
 #[derive(Subcommand)]
@@ -85,62 +113,28 @@ enum Commands {
         input: String,
     },
 
-    #[command(about = "Browse and restore S3 snapshots using TUI")]
-    BrowseSnapshots {
-        /// S3 bucket containing the snapshots
-        #[arg(long, env = "S3_BUCKET")]
-        bucket: Option<String>,
-
-        /// AWS region
-        #[arg(long, env = "S3_REGION")]
-        region: Option<String>,
-
-        /// Filter S3 objects by prefix
-        #[arg(long, env = "S3_PREFIX")]
-        prefix: Option<String>,
-
-        /// Custom endpoint URL (e.g. for MinIO)
-        #[arg(long, env = "S3_ENDPOINT_URL")]
-        endpoint_url: Option<String>,
-
-        /// AWS access key ID
-        #[arg(long, env = "S3_ACCESS_KEY_ID")]
-        access_key_id: Option<String>,
-
-        /// AWS secret access key
-        #[arg(long, env = "S3_SECRET_ACCESS_KEY")]
-        secret_access_key: Option<String>,
-
-        /// Use path-style addressing
-        #[arg(long, env = "S3_PATH_STYLE", default_value = "true")]
-        path_style: bool,
-    },
+    /// Browse and restore S3 snapshots using TUI
+    BrowseSnapshots,
 }
 
 async fn connect_ssl(config: &PgConfig, verify: bool, root_cert_path: Option<&str>) -> Result<tokio_postgres::Client> {
     let mut builder = TlsConnector::builder();
-
     if !verify {
         builder.danger_accept_invalid_certs(true);
     }
-
-    if let Some(cert_path) = root_cert_path {
-        let cert_data = std::fs::read(cert_path)
-            .context("Failed to read root certificate file")?;
-        let cert = native_tls::Certificate::from_pem(&cert_data)
-            .context("Failed to parse root certificate")?;
+    if let Some(path) = root_cert_path {
+        let cert_data = std::fs::read(path)?;
+        let cert = native_tls::Certificate::from_pem(&cert_data)?;
         builder.add_root_certificate(cert);
     }
+    let connector = builder.build()?;
+    let connector = MakeTlsConnector::new(connector);
 
-    let connector = MakeTlsConnector::new(builder.build()?);
-    let (client, connection) = config
-        .connect(connector)
-        .await
-        .context("Failed to connect to PostgreSQL with SSL")?;
+    let (client, connection) = config.connect(connector).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            error!("SSL connection error: {}", e);
+            error!("connection error: {}", e);
         }
     });
 
@@ -148,37 +142,53 @@ async fn connect_ssl(config: &PgConfig, verify: bool, root_cert_path: Option<&st
 }
 
 async fn connect_no_ssl(config: &PgConfig) -> Result<tokio_postgres::Client> {
-    let (client, connection) = config
-        .connect(tokio_postgres::NoTls)
-        .await
-        .context("Failed to connect to PostgreSQL without SSL")?;
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            error!("Connection error: {}", e);
+            error!("connection error: {}", e);
         }
     });
 
     Ok(client)
 }
 
-async fn connect(cli: &Cli) -> Result<tokio_postgres::Client> {
-    let mut config = PgConfig::new();
-    config.host(&cli.host);
-    config.port(cli.port);
-
-    if let Some(username) = &cli.username {
-        config.user(username);
+async fn connect(cli: &Cli) -> Result<Option<tokio_postgres::Client>> {
+    if !cli.host.is_some() && !cli.port.is_some() && !cli.username.is_some() && !cli.password.is_some() {
+        // If no PostgreSQL settings are provided, return None
+        return Ok(None);
     }
 
-    if let Some(password) = &cli.password {
+    let mut config = PgConfig::new();
+
+    if cli.use_ssl {
+        config.ssl_mode(SslMode::Require);
+    }
+
+    // Set default host and port if not provided
+    config.host(&cli.host.clone().unwrap_or_else(|| "localhost".to_string()));
+    config.port(cli.port.unwrap_or(5432));
+
+    if let Some(ref user) = cli.username {
+        config.user(user);
+    }
+
+    if let Some(ref password) = cli.password {
         config.password(password);
     }
 
-    if cli.use_ssl {
+    let result = if cli.use_ssl {
         connect_ssl(&config, cli.verify_ssl, cli.root_cert_path.as_deref()).await
     } else {
         connect_no_ssl(&config).await
+    };
+
+    match result {
+        Ok(client) => Ok(Some(client)),
+        Err(e) => {
+            warn!("Failed to connect to PostgreSQL: {}", e);
+            Ok(None)
+        }
     }
 }
 
@@ -227,88 +237,6 @@ async fn drop_database(client: &tokio_postgres::Client, name: &str) -> Result<()
     Ok(())
 }
 
-fn parse_snapshot_key(snapshot_key: &str) -> Result<(String, String)> {
-    debug!("Parsing snapshot key: {}", snapshot_key);
-    let parts: Vec<&str> = snapshot_key.split('/').collect();
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid snapshot key format"));
-    }
-
-    let bucket = parts[0].to_string();
-    let key = parts[1..].join("/");
-    debug!("Parsed bucket: {}, key: {}", bucket, key);
-
-    Ok((bucket, key))
-}
-
-async fn restore_from_s3(client: &tokio_postgres::Client, cli: &Cli, snapshot_key: &str) -> Result<()> {
-    debug!("Starting S3 snapshot restoration from key: {}", snapshot_key);
-    debug!("Parsing snapshot key: {}", snapshot_key);
-    let (bucket, key) = parse_snapshot_key(snapshot_key)?;
-    debug!("Parsed bucket: {}, key: {}", bucket, key);
-
-    // Create a new database for restore
-    let restore_db = format!("{}-restore", key.trim_end_matches(".dump"));
-    debug!("Will restore to database: {}", restore_db);
-    debug!("Creating target database: {}", restore_db);
-    create_database(client, &restore_db).await?;
-
-    // Download snapshot from S3
-    debug!("Loading AWS config from environment");
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    debug!("Creating S3 client");
-    let s3_client = S3Client::new(&config);
-
-    debug!("Creating temporary file for snapshot");
-    let temp_file = tempfile::NamedTempFile::new()?;
-    let temp_path = temp_file.path().to_path_buf();
-    debug!("Temporary file created at: {}", temp_path.display());
-
-    debug!("Requesting object from S3: bucket={}, key={}", bucket, key);
-    let object = s3_client
-        .get_object()
-        .bucket(bucket)
-        .key(&key)
-        .send()
-        .await?;
-    debug!("Successfully retrieved object from S3");
-
-    debug!("Converting object body to async reader");
-    let mut body = object.body.into_async_read();
-    debug!("Opening temporary file for async writing");
-    let file = File::create(&temp_path).await?;
-    let mut writer = BufWriter::new(file);
-
-    debug!("Copying S3 object to temporary file");
-    let mut buffer = vec![0; 8192];
-    loop {
-        let n = body.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buffer[..n]).await?;
-    }
-    writer.flush().await?;
-    debug!("Successfully copied object to temporary file");
-
-    // Restore the database
-    backup::restore_database(
-        &restore_db,
-        temp_path.to_str().unwrap(),
-        &cli.host,
-        cli.port,
-        cli.username.as_deref(),
-        cli.password.as_deref(),
-        cli.use_ssl,
-    )
-    .await?;
-
-    println!("Successfully restored snapshot to database: {}", restore_db);
-
-    info!("Successfully restored snapshot to database: {}", restore_db);
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Configure logging
@@ -333,55 +261,113 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::List => {
-            list_databases(&client).await?;
-        }
-        Commands::Create { name } => {
-            create_database(&client, name).await?;
-        }
-        Commands::Drop { name } => {
-            drop_database(&client, name).await?;
-        }
-        Commands::Clone { name } => {
-            clone_database(&client, name).await?;
-        }
-        Commands::Dump { name, output } => {
-            info!("Dumping database '{}' to '{}'", name, output);
-            backup::dump_database(
-                name,
-                output,
-                &cli.host,
-                cli.port,
-                cli.username.as_deref(),
-                cli.password.as_deref(),
-                cli.use_ssl,
-            ).await?
-        }
-        Commands::Restore { name, input } => {
-            backup::restore_database(
-                name,
-                input,
-                &cli.host,
-                cli.port,
-                cli.username.as_deref(),
-                cli.password.as_deref(),
-                cli.use_ssl,
-            )
-            .await?
-        }
-        Commands::BrowseSnapshots { bucket, region, endpoint_url, access_key_id, secret_access_key, path_style, prefix } => {
-            if let Some(snapshot_key) = tui::run_tui(
-                bucket.clone(),
-                region.clone(),
-                prefix.clone(),
-                endpoint_url.clone(),
-                access_key_id.clone(),
-                secret_access_key.clone(),
-                *path_style,
-            ).await? {
-                restore_from_s3(&client, &cli, &snapshot_key).await?
+            if let Some(client) = client {
+                list_databases(&client).await?;
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
             }
         }
+        Commands::Create { name } => {
+            if let Some(client) = client {
+                create_database(&client, &name).await?;
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
+            }
         }
+        Commands::Drop { name } => {
+            if let Some(client) = client {
+                drop_database(&client, &name).await?;
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
+            }
+        }
+        Commands::Clone { name } => {
+            if let Some(client) = client {
+                clone_database(&client, &name).await?;
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
+            }
+        }
+        Commands::Dump { name, output } => {
+            if let Some(_) = client {
+                info!("Dumping database '{}' to '{}'", name, output);
+                backup::dump_database(
+                    &name,
+                    &output,
+                    &cli.host.clone().unwrap_or_else(|| "localhost".to_string()),
+                    cli.port.unwrap_or(5432),
+                    cli.username.as_deref(),
+                    cli.password.as_deref(),
+                    cli.use_ssl,
+                )
+                .await?
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
+            }
+        }
+        Commands::Restore { name, input } => {
+            if let Some(_) = client {
+                backup::restore_database(
+                    &name,
+                    &input,
+                    &cli.host.clone().unwrap_or_else(|| "localhost".to_string()),
+                    cli.port.unwrap_or(5432),
+                    cli.username.as_deref(),
+                    cli.password.as_deref(),
+                    cli.use_ssl,
+                )
+                .await?
+            } else {
+                error!("PostgreSQL connection required for this command");
+                return Ok(());
+            }
+        }
+        Commands::BrowseSnapshots => {
+            enable_raw_mode()?;
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            let backend = CrosstermBackend::new(stdout);
+            let mut terminal = Terminal::new(backend)?;
+
+            let browser = SnapshotBrowser::new(
+                S3Config {
+                    bucket: cli.bucket.unwrap_or_default(),
+                    region: cli.region.unwrap_or_default(),
+                    prefix: cli.prefix.unwrap_or_default(),
+                    endpoint_url: cli.endpoint_url,
+                    access_key_id: cli.access_key_id,
+                    secret_access_key: cli.secret_access_key,
+                    path_style: true,
+                    error_message: None,
+                },
+                PostgresConfig {
+                    host: cli.host.clone(),
+                    port: cli.port,
+                    username: cli.username.clone(),
+                    password: cli.password.clone(),
+                    use_ssl: cli.use_ssl,
+                    db_name: None,
+                },
+            );
+
+            let res = tui::run_app(&mut terminal, browser).await?;
+
+            // restore terminal
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+            terminal.show_cursor()?;
+
+            if let Some(snapshot_key) = res {
+                // Handle the selected snapshot
+                info!("Selected snapshot: {}", snapshot_key);
+            }
+        }
+    }
 
     Ok(())
 }

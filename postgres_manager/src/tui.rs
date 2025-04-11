@@ -31,61 +31,85 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
-#[derive(PartialEq)]
-enum InputMode {
+#[derive(Default)]
+pub struct PostgresConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub use_ssl: bool,
+    pub db_name: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum InputMode {
     Normal,
     Editing,
 }
 
-#[derive(Debug, PartialEq)]
-enum FocusField {
-    Prefix,
-    Bucket,
-    Region,
-    EndpointUrl,
-    AccessKeyId,
-    SecretAccessKey,
-    PathStyle,
+#[derive(PartialEq)]
+pub enum FocusField {
+    // S3 Settings (10-19)
+    Bucket,          // Alt+1
+    Region,          // Alt+2
+    Prefix,          // Alt+3
+    EndpointUrl,     // Alt+4
+    AccessKeyId,     // Alt+5
+    SecretAccessKey, // Alt+6
+    PathStyle,       // Alt+7
+
+    // PostgreSQL Settings (20-29)
+    PgHost,          // Alt+q
+    PgPort,          // Alt+w
+    PgUsername,      // Alt+e
+    PgPassword,      // Alt+r
+    PgSsl,          // Alt+t
+    PgDbName,        // Alt+y
     SnapshotList,
 }
 
+use aws_sdk_s3::primitives::DateTime;
+use chrono::{DateTime as ChronoDateTime, NaiveDateTime, Utc};
+use log::info;
+use humansize::{format_size, BINARY};
+
+#[derive(Debug, Clone)]
+pub struct BackupMetadata {
+    pub key: String,
+    pub size: i64,
+    pub last_modified: DateTime,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PopupState {
+    Hidden,
+    ConfirmRestore,
+}
+
 pub struct SnapshotBrowser {
-    snapshots: Vec<String>,
-    state: ListState,
-    s3_client: Option<S3Client>,
-    config: S3Config,
-    input_mode: InputMode,
-    focus: FocusField,
-    input_buffer: String,
+    pub config: S3Config,
+    pub pg_config: PostgresConfig,
+    pub popup_state: PopupState,
+    pub snapshots: Vec<BackupMetadata>,
+    pub state: ListState,
+    pub s3_client: Option<S3Client>,
+    pub focus: FocusField,
+    pub input_mode: InputMode,
+    pub input_buffer: String,
 }
 
 impl SnapshotBrowser {
-    pub fn new(
-        bucket: Option<String>,
-        region: Option<String>,
-        prefix: Option<String>,
-        endpoint_url: Option<String>,
-        access_key_id: Option<String>,
-        secret_access_key: Option<String>,
-        path_style: bool,
-    ) -> Self {
+    pub fn new(config: S3Config, pg_config: PostgresConfig) -> Self {
         Self {
+            config,
+            pg_config,
             snapshots: Vec::new(),
             state: ListState::default(),
             s3_client: None,
-            config: S3Config {
-                bucket: bucket.unwrap_or_default(),
-                region: region.unwrap_or_else(|| "us-west-2".to_string()),
-                prefix: prefix.unwrap_or_default(),
-                endpoint_url,
-                access_key_id,
-                secret_access_key,
-                path_style,
-                error_message: None,
-            },
+            focus: FocusField::SnapshotList,
             input_mode: InputMode::Normal,
-            focus: FocusField::Bucket,
             input_buffer: String::new(),
+            popup_state: PopupState::Hidden,
         }
     }
 
@@ -221,11 +245,19 @@ impl SnapshotBrowser {
         if let Some(contents) = objects.contents {
             self.snapshots = contents
                 .into_iter()
-                .filter_map(|obj| obj.key)
-                .map(String::from)
+                .filter_map(|obj| {
+                    match (obj.key, obj.size, obj.last_modified) {
+                        (Some(key), size, Some(last_modified)) => Some(BackupMetadata {
+                            key: key.clone(),
+                            size: size.unwrap_or(0),
+                            last_modified,
+                        }),
+                        _ => None,
+                    }
+                })
                 .collect();
             debug!("Found {} snapshots in bucket", self.snapshots.len());
-            self.snapshots.sort();
+            self.snapshots.sort_by(|a, b| b.last_modified.cmp(&a.last_modified)); // Sort newest first
         }
 
         if !self.snapshots.is_empty() {
@@ -263,14 +295,14 @@ impl SnapshotBrowser {
         self.state.select(Some(i));
     }
 
-    fn selected_snapshot(&self) -> Option<&str> {
+    pub fn selected_snapshot(&self) -> Option<&BackupMetadata> {
         self.state
             .selected()
             .and_then(|i| self.snapshots.get(i))
-            .map(|s| s.as_str())
     }
 }
 
+#[allow(dead_code)]
 pub async fn run_tui(
     bucket: Option<String>,
     region: Option<String>,
@@ -287,14 +319,19 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut browser = SnapshotBrowser::new(
-        bucket,
-        region,
-        prefix,
-        endpoint_url,
-        access_key_id,
-        secret_access_key,
-        path_style,
+        S3Config {
+            bucket: bucket.unwrap_or_default(),
+            region: region.unwrap_or_else(|| "us-west-2".to_string()),
+            prefix: prefix.unwrap_or_default(),
+            endpoint_url,
+            access_key_id,
+            secret_access_key,
+            path_style,
+            error_message: None,
+        },
+        PostgresConfig::default(),
     );
+    browser.popup_state = PopupState::Hidden;
     browser.load_snapshots().await?;
 
     let result = run_app(&mut terminal, browser).await;
@@ -310,9 +347,11 @@ pub async fn run_tui(
     result
 }
 
+#[allow(dead_code)]
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
+        .margin(1)
         .constraints([
             Constraint::Length((r.height - height) / 2),
             Constraint::Length(height),
@@ -330,7 +369,11 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBrowser) -> Result<Option<String>> {
+pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBrowser) -> Result<Option<String>> {
+    // Initial snapshot load
+    if let Err(e) = browser.load_snapshots().await {
+        error!("Failed to load initial snapshots: {}", e);
+    }
     loop {
         terminal.draw(|f| ui(f, &mut browser))?;
 
@@ -340,49 +383,119 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                     KeyCode::Char('q') => return Ok(None),
                     KeyCode::Enter => {
                         if browser.focus == FocusField::SnapshotList {
-                            return Ok(browser.selected_snapshot().map(String::from));
+                            if browser.selected_snapshot().is_some() {
+                                browser.popup_state = PopupState::ConfirmRestore;
+                            }
                         }
                     }
                     KeyCode::Tab => {
                         browser.focus = match browser.focus {
+                            FocusField::SnapshotList => FocusField::Bucket,
+                            // S3 Settings
                             FocusField::Bucket => FocusField::Region,
                             FocusField::Region => FocusField::Prefix,
                             FocusField::Prefix => FocusField::EndpointUrl,
                             FocusField::EndpointUrl => FocusField::AccessKeyId,
                             FocusField::AccessKeyId => FocusField::SecretAccessKey,
                             FocusField::SecretAccessKey => FocusField::PathStyle,
-                            FocusField::PathStyle => FocusField::SnapshotList,
-                            FocusField::SnapshotList => FocusField::Bucket,
+                            FocusField::PathStyle => FocusField::PgHost,
+                            // PostgreSQL Settings
+                            FocusField::PgHost => FocusField::PgPort,
+                            FocusField::PgPort => FocusField::PgUsername,
+                            FocusField::PgUsername => FocusField::PgPassword,
+                            FocusField::PgPassword => FocusField::PgSsl,
+                            FocusField::PgSsl => FocusField::PgDbName,
+                            FocusField::PgDbName => FocusField::SnapshotList,
+
                         };
                     }
-                    KeyCode::Char('e') => {
-                        if browser.focus != FocusField::SnapshotList {
-                            browser.input_mode = InputMode::Editing;
-                            browser.input_buffer = match browser.focus {
-                                FocusField::Bucket => browser.config.bucket.clone(),
-                                FocusField::Region => browser.config.region.clone(),
-                                FocusField::EndpointUrl => browser.config.endpoint_url.clone().unwrap_or_default(),
-                                FocusField::AccessKeyId => browser.config.access_key_id.clone().unwrap_or_default(),
-                                FocusField::SecretAccessKey => browser.config.secret_access_key.clone().unwrap_or_default(),
-                                FocusField::PathStyle => browser.config.path_style.to_string(),
-                                _ => String::new(),
-                            };
-                        }
+                    // Edit mode
+                    KeyCode::Char('e') if browser.focus != FocusField::SnapshotList => {
+                        browser.input_mode = InputMode::Editing;
+                        browser.input_buffer = match browser.focus {
+                            FocusField::Bucket => browser.config.bucket.clone(),
+                            FocusField::Region => browser.config.region.clone(),
+                            FocusField::Prefix => browser.config.prefix.clone(),
+                            FocusField::EndpointUrl => browser.config.endpoint_url.clone().unwrap_or_default(),
+                            FocusField::AccessKeyId => browser.config.access_key_id.clone().unwrap_or_default(),
+                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone().unwrap_or_default(),
+                            FocusField::PathStyle => browser.config.path_style.to_string(),
+                            FocusField::PgHost => browser.pg_config.host.clone().unwrap_or_default(),
+                            FocusField::PgPort => browser.pg_config.port.map(|p| p.to_string()).unwrap_or_default(),
+                            FocusField::PgUsername => browser.pg_config.username.clone().unwrap_or_default(),
+                            FocusField::PgPassword => browser.pg_config.password.clone().unwrap_or_default(),
+                            FocusField::PgSsl => browser.pg_config.use_ssl.to_string(),
+                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default(),
+                            _ => String::new(),
+                        };
                     }
+
+                    // S3 Settings shortcuts (1-7)
+                    KeyCode::Char('b') => browser.focus = FocusField::Bucket,
+                    KeyCode::Char('R') => browser.focus = FocusField::Region,
+                    KeyCode::Char('x') => browser.focus = FocusField::Prefix,
+                    KeyCode::Char('E') => browser.focus = FocusField::EndpointUrl,
+                    KeyCode::Char('a') => browser.focus = FocusField::AccessKeyId,
+                    KeyCode::Char('s') => browser.focus = FocusField::SecretAccessKey,
+                    KeyCode::Char('y') => {
+                        if browser.popup_state == PopupState::ConfirmRestore {
+                            if let Some(snapshot) = browser.selected_snapshot() {
+                                return Ok(Some(snapshot.key.clone()));
+                            }
+                        } else {
+                            browser.focus = FocusField::PathStyle;
+                        }
+                    },
+                    // PostgreSQL Settings shortcuts (a-h)
+                    KeyCode::Char('h') => browser.focus = FocusField::PgHost,
+                    KeyCode::Char('p') => browser.focus = FocusField::PgPort,
+                    KeyCode::Char('u') => browser.focus = FocusField::PgUsername,
+                    KeyCode::Char('f') => browser.focus = FocusField::PgPassword,
+                    KeyCode::Char('l') => browser.focus = FocusField::PgSsl,
+                    KeyCode::Char('n') => {
+                        if browser.popup_state == PopupState::ConfirmRestore {
+                            browser.popup_state = PopupState::Hidden;
+                        } else {
+                            browser.focus = FocusField::PgDbName;
+                        }
+                    },
                     KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => browser.next(),
                     KeyCode::Up | KeyCode::Char('k') if browser.focus == FocusField::SnapshotList => browser.previous(),
                     KeyCode::Char('r') => {
                         if let Err(e) = browser.load_snapshots().await {
-                            error!("Failed to list snapshots: {}", e);
+                            error!("Failed to refresh snapshots: {}", e);
                         }
-                    }
-                    _ => {}
+                    },
+                    KeyCode::Char('e') => {
+                        browser.input_mode = InputMode::Editing;
+                        // Pre-populate input buffer with current value based on focus
+                        browser.input_buffer = match browser.focus {
+                            FocusField::Bucket => browser.config.bucket.clone(),
+                            FocusField::Region => browser.config.region.clone(),
+                            FocusField::Prefix => browser.config.prefix.clone(),
+                            FocusField::EndpointUrl => browser.config.endpoint_url.clone().unwrap_or_default(),
+                            FocusField::AccessKeyId => browser.config.access_key_id.clone().unwrap_or_default(),
+                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone().unwrap_or_default(),
+                            FocusField::PathStyle => browser.config.path_style.to_string(),
+                            FocusField::PgHost => browser.pg_config.host.clone().unwrap_or_default(),
+                            FocusField::PgPort => browser.pg_config.port.map(|p| p.to_string()).unwrap_or_default(),
+                            FocusField::PgUsername => browser.pg_config.username.clone().unwrap_or_default(),
+                            FocusField::PgPassword => browser.pg_config.password.clone().unwrap_or_default(),
+                            FocusField::PgSsl => browser.pg_config.use_ssl.to_string(),
+                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                    },
+                    _ => {},
                 },
                 InputMode::Editing => match key.code {
                     KeyCode::Enter => {
-                        debug!("Enter key pressed, attempting to initialize S3 client");
-                        browser.input_mode = InputMode::Normal;
-                        match browser.focus {
+                        if browser.focus == FocusField::SnapshotList {
+                            browser.popup_state = PopupState::ConfirmRestore;
+                        } else {
+                            debug!("Enter key pressed, attempting to initialize S3 client");
+                            browser.input_mode = InputMode::Normal;
+                            match browser.focus {
                             FocusField::Bucket => browser.config.bucket = browser.input_buffer.clone(),
                             FocusField::Region => browser.config.region = browser.input_buffer.clone(),
                             FocusField::Prefix => browser.config.prefix = browser.input_buffer.clone(),
@@ -401,6 +514,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                                 };
                             }
                             FocusField::SecretAccessKey => {
+
                                 browser.config.secret_access_key = if browser.input_buffer.is_empty() {
                                     None
                                 } else {
@@ -412,15 +526,35 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: SnapshotBr
                             }
                             _ => {}
                         }
+                        // Clear any existing client to force reinitialization
+                        browser.s3_client = None;
                         if let Err(e) = browser.load_snapshots().await {
                             error!("Failed to list snapshots: {}", e);
                         }
+                        }
                     }
                     KeyCode::Esc => {
-                        browser.input_mode = InputMode::Normal;
+                        if browser.popup_state != PopupState::Hidden {
+                            browser.popup_state = PopupState::Hidden;
+                        } else {
+                            browser.input_mode = InputMode::Normal;
+                        }
                     }
                     KeyCode::Char(c) => {
-                        browser.input_buffer.push(c);
+                        if browser.popup_state != PopupState::Hidden {
+                            match c {
+                                'y' => {
+                                    if let Some(snapshot) = browser.selected_snapshot() {
+                                        info!("Selected backup for restore: {} ({})", snapshot.key, format_size(snapshot.size as u64, BINARY));
+                                        return Ok(Some(snapshot.key.clone()));
+                                    }
+                                }
+                                'n' => browser.popup_state = PopupState::Hidden,
+                                _ => {},
+                            }
+                        } else {
+                            browser.input_buffer.push(c);
+                        }
                     }
                     KeyCode::Backspace => {
                         browser.input_buffer.pop();
@@ -437,11 +571,19 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3),   // Title
-            Constraint::Ratio(2, 10),  // Config (20%)
-            Constraint::Min(10),     // Snapshots (remaining space)
+            Constraint::Length(3),  // Title
+            Constraint::Length(3),  // Input Mode
+            Constraint::Length(10), // Configuration
+            Constraint::Min(0),     // Snapshots
         ])
         .split(f.size());
+
+    // Input mode
+    let input_mode = match browser.input_mode {
+        InputMode::Normal => "Press 'e' to edit | 'q' to quit | 'r' to refresh",
+        InputMode::Editing => "Press <Enter> to save | <Esc> to cancel",
+    };
+
 
     // Split the snapshots area into list and help sections
     let list_chunks = Layout::default()
@@ -450,10 +592,12 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
             Constraint::Min(1),      // Snapshots list
             Constraint::Length(3),   // Help text
         ])
-        .split(chunks[2]);
+        .split(chunks[3]);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled("PostgreSQL S3 Snapshots", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" | "),
+        Span::styled(input_mode, Style::default()),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -462,34 +606,82 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
     let config_block = Block::default()
         .title("Configuration")
         .borders(Borders::ALL);
-    let config_inner = Layout::default()
+    let config_area = Layout::default()
         .direction(Direction::Horizontal)
         .margin(1)
         .constraints([
-            Constraint::Ratio(1, 2),  // Left column
-            Constraint::Ratio(1, 2),  // Right column
+            Constraint::Ratio(1, 2),  // S3 Settings
+            Constraint::Ratio(1, 2),  // PostgreSQL Settings
         ])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
-    let left_column = Layout::default()
+    // S3 Settings
+    let s3_block = Block::default()
+        .title("S3 Settings ")
+        .borders(Borders::ALL);
+    let s3_inner = s3_block.inner(config_area[0]);
+    f.render_widget(s3_block, config_area[0]);
+
+    let s3_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 2),
+            Constraint::Ratio(1, 2),
+        ])
+        .split(s3_inner);
+
+    let s3_left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Bucket
-            Constraint::Length(1),  // Region
-            Constraint::Length(1),  // Prefix
-            Constraint::Length(1),  // Endpoint
+            Constraint::Length(1),  // Bucket (1)
+            Constraint::Length(1),  // Region (2)
+            Constraint::Length(1),  // Prefix (3)
+            Constraint::Length(1),  // Endpoint (4)
         ])
-        .split(config_inner[0]);
+        .split(s3_columns[0]);
 
-    let right_column = Layout::default()
+    let s3_right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Access Key
-            Constraint::Length(1),  // Secret Key
-            Constraint::Length(1),  // Path Style
+            Constraint::Length(1),  // Access Key (5)
+            Constraint::Length(1),  // Secret Key (6)
+            Constraint::Length(1),  // Path Style (7)
             Constraint::Length(1),  // Empty
         ])
-        .split(config_inner[1]);
+        .split(s3_columns[1]);
+
+    // PostgreSQL Settings
+    let pg_block = Block::default()
+        .title("PostgreSQL Settings ")
+        .borders(Borders::ALL);
+    let pg_inner = pg_block.inner(config_area[1]);
+    f.render_widget(pg_block, config_area[1]);
+
+    let pg_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 2),
+            Constraint::Ratio(1, 2),
+        ])
+        .split(pg_inner);
+
+    let pg_left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // Host (q)
+            Constraint::Length(1),  // Port (w)
+            Constraint::Length(1),  // Username (e)
+        ])
+        .split(pg_columns[0]);
+
+    let pg_right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // Password (r)
+            Constraint::Length(1),  // SSL (t)
+            Constraint::Length(1),  // DB Name (y)
+        ])
+        .split(pg_columns[1]);
 
     let prefix_style = if browser.focus == FocusField::Prefix {
         Style::default().fg(Color::Yellow)
@@ -498,7 +690,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
     };
 
     let prefix_line = Line::from(vec![
-        Span::raw("Prefix: "),
+        Span::raw("[x] Prefix: "),
         Span::styled(
             if browser.focus == FocusField::Prefix && browser.input_mode == InputMode::Editing {
                 &browser.input_buffer
@@ -544,102 +736,226 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
     };
 
     let bucket_line = Line::from(vec![
-        Span::raw("Bucket: "),
+        Span::raw("[b] Bucket: "),
         Span::styled(&browser.config.bucket, bucket_style),
     ]);
     let region_line = Line::from(vec![
-        Span::raw("Region: "),
+        Span::raw("[R] Region: "),
         Span::styled(&browser.config.region, region_style),
     ]);
     let endpoint_line = Line::from(vec![
-        Span::raw("Endpoint: "),
+        Span::raw("[E] Endpoint: "),
         Span::styled(
             browser.config.endpoint_url.as_deref().unwrap_or(""),
             endpoint_style,
         ),
     ]);
 
+    fn mask_key(key: &str) -> String {
+        if key.len() <= 8 {
+            "*".repeat(key.len())
+        } else {
+            format!("{}.....{}",
+                &key[..4],
+                &key[key.len().saturating_sub(4)..]
+            )
+        }
+    }
+
+    let masked_access_key = mask_key(browser.config.access_key_id.as_deref().unwrap_or(""));
     let access_key_line = Line::from(vec![
-        Span::raw("Access Key ID: "),
+        Span::raw("[a] Access Key ID: "),
         Span::styled(
-            browser.config.access_key_id.as_deref().unwrap_or(""),
+            &masked_access_key,
             access_key_style,
         ),
     ]);
 
+    let masked_secret_key = mask_key(browser.config.secret_access_key.as_deref().unwrap_or(""));
     let secret_key_line = Line::from(vec![
-        Span::raw("Secret Key: "),
+        Span::raw("[s] Secret Key: "),
         Span::styled(
-            browser.config.secret_access_key.as_deref().unwrap_or(""),
+            &masked_secret_key,
             secret_key_style,
         ),
     ]);
 
     let path_style_line = Line::from(vec![
-        Span::raw("Path Style: "),
+        Span::raw("[y] Path Style: "),
         Span::styled(
             browser.config.path_style.to_string(),
             path_style_style,
         ),
     ]);
 
-    f.render_widget(Paragraph::new(bucket_line), left_column[0]);
-    f.render_widget(Paragraph::new(region_line), left_column[1]);
-    f.render_widget(Paragraph::new(prefix_line), left_column[2]);
-    f.render_widget(Paragraph::new(endpoint_line), left_column[3]);
-    f.render_widget(Paragraph::new(access_key_line), right_column[0]);
-    f.render_widget(Paragraph::new(secret_key_line), right_column[1]);
-    f.render_widget(Paragraph::new(path_style_line), right_column[2]);
-    f.render_widget(config_block, chunks[1]);
+    // Render S3 settings
+    f.render_widget(Paragraph::new(bucket_line), s3_left[0]);
+    f.render_widget(Paragraph::new(region_line), s3_left[1]);
+    f.render_widget(Paragraph::new(prefix_line), s3_left[2]);
+    f.render_widget(Paragraph::new(endpoint_line), s3_left[3]);
+    f.render_widget(Paragraph::new(access_key_line), s3_right[0]);
+    f.render_widget(Paragraph::new(secret_key_line), s3_right[1]);
+    f.render_widget(Paragraph::new(path_style_line), s3_right[2]);
+
+    // Create PostgreSQL lines
+    let host_style = if browser.focus == FocusField::PgHost { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let port_style = if browser.focus == FocusField::PgPort { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let username_style = if browser.focus == FocusField::PgUsername { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let password_style = if browser.focus == FocusField::PgPassword { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let ssl_style = if browser.focus == FocusField::PgSsl { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let dbname_style = if browser.focus == FocusField::PgDbName { Style::default().fg(Color::Yellow) } else { Style::default() };
+
+    let host_line = Line::from(vec![
+        Span::raw("[h] Host: "),
+        Span::styled(
+            browser.pg_config.host.as_deref().unwrap_or(""),
+            host_style,
+        ),
+    ]);
+
+    let port_line = Line::from(vec![
+        Span::raw("[p] Port: "),
+        Span::styled(
+            browser.pg_config.port.map(|p| p.to_string()).unwrap_or_default(),
+            port_style,
+        ),
+    ]);
+
+    let username_line = Line::from(vec![
+        Span::raw("[u] Username: "),
+        Span::styled(
+            browser.pg_config.username.as_deref().unwrap_or(""),
+            username_style,
+        ),
+    ]);
+
+    let masked_pg_password = mask_key(browser.pg_config.password.as_deref().unwrap_or(""));
+    let password_line = Line::from(vec![
+        Span::raw("[f] Password: "),
+        Span::styled(
+            &masked_pg_password,
+            password_style,
+        ),
+    ]);
+
+    let ssl_line = Line::from(vec![
+        Span::raw("[l] SSL: "),
+        Span::styled(
+            if browser.pg_config.use_ssl { "Yes" } else { "No" },
+            ssl_style,
+        ),
+    ]);
+
+    let dbname_line = Line::from(vec![
+        Span::raw("[n] DB Name: "),
+        Span::styled(
+            browser.pg_config.db_name.as_deref().unwrap_or(""),
+            dbname_style,
+        ),
+    ]);
+
+    // Render PostgreSQL settings
+    f.render_widget(Paragraph::new(host_line), pg_left[0]);
+    f.render_widget(Paragraph::new(port_line), pg_left[1]);
+    f.render_widget(Paragraph::new(username_line), pg_left[2]);
+    f.render_widget(Paragraph::new(password_line), pg_right[0]);
+    f.render_widget(Paragraph::new(ssl_line), pg_right[1]);
+    f.render_widget(Paragraph::new(dbname_line), pg_right[2]);
+    f.render_widget(config_block, chunks[2]);
 
     // Input mode
     if browser.input_mode == InputMode::Editing {
-        let input_style = Style::default().fg(Color::Yellow);
+        // Create a small rect at the top of the screen for input
+        let input_area = Rect {
+            x: 0,
+            y: 0,
+            width: f.size().width,
+            height: 3,
+        };
         let input = Paragraph::new(browser.input_buffer.as_str())
-            .style(input_style)
+            .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Input"));
-        let area = centered_rect(60, 3, f.size());
-        f.render_widget(Clear, area);
-        f.render_widget(input, area);
-    }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(f.size());
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled("PostgreSQL Snapshots", Style::default().add_modifier(Modifier::BOLD)),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
+        f.render_widget(Clear, input_area);
+        f.render_widget(input, input_area);
+    }
 
     let items: Vec<ListItem> = browser
         .snapshots
         .iter()
-        .map(|s| ListItem::new(s.as_str()))
+        .enumerate()
+        .map(|(i, snapshot)| {
+            let style = if Some(i) == browser.state.selected() {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let timestamp = snapshot.last_modified.as_secs_f64() as i64;
+            let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
+            let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
+            let date = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+            let size = format_size(snapshot.size as u64, BINARY);
+            let content = format!("{:<60} {} {}", snapshot.key, date, size);
+            ListItem::new(content).style(style)
+        })
         .collect();
 
     let snapshots_block = Block::default()
         .title("Snapshots")
         .borders(Borders::ALL);
+    let inner = snapshots_block.inner(list_chunks[0]);
+    f.render_widget(&snapshots_block, chunks[3]);
 
     let snapshots_list = List::new(items)
         .style(Style::default().fg(Color::White))
-        .highlight_style(Style::default().bg(Color::DarkGray))
+        .block(Block::default())
         .highlight_symbol(">> ");
 
-    let inner = snapshots_block.inner(list_chunks[0]);
-    f.render_widget(snapshots_block, list_chunks[0]);
     f.render_stateful_widget(snapshots_list, inner, &mut browser.state);
 
     let help = Paragraph::new("↑/↓: Navigate • Enter: Select • q: Quit")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(help, list_chunks[1]);
+
+    // Draw confirmation popup if active
+    if browser.popup_state == PopupState::ConfirmRestore {
+        if let Some(snapshot) = browser.selected_snapshot() {
+            let popup_block = Block::default()
+                .title("Confirm Restore")
+                .borders(Borders::ALL);
+
+            let area = centered_rect(60, 20, f.size());
+            f.render_widget(Clear, area); // Clear the background
+            
+            let popup = Paragraph::new(vec![
+                Line::from(vec![Span::raw("Are you sure you want to restore this backup?")]),
+                Line::from(vec![]),
+                Line::from(vec![Span::raw("File: "), Span::styled(
+                    &snapshot.key,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![Span::raw("Date: "), Span::styled(
+                    {
+                        let timestamp = snapshot.last_modified.as_secs_f64() as i64;
+                        let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap_or_default();
+                        let datetime: ChronoDateTime<Utc> = ChronoDateTime::from_naive_utc_and_offset(naive, Utc);
+                        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![Span::raw("Size: "), Span::styled(
+                    format_size(snapshot.size as u64, BINARY),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![]),
+                Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to cancel")]),
+            ])
+            .alignment(Alignment::Center)
+            .block(popup_block);
+
+            f.render_widget(popup, area);
+        }
+    }
 
     if let Some(error) = &browser.config.error_message {
         let error_block = Block::default()
