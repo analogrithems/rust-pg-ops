@@ -18,16 +18,36 @@ use ratatui::{
 use std::io;
 use crate::{connect_ssl, connect_no_ssl};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct S3Config {
-    pub error_message: Option<String>,
     pub bucket: String,
     pub region: String,
     pub prefix: String,
-    pub endpoint_url: Option<String>,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
+    pub endpoint_url: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
     pub path_style: bool,
+    pub error_message: Option<String>,
+}
+
+impl S3Config {
+    fn mask_secret(&self, secret: &str) -> String {
+        if secret.is_empty() {
+            return "not set".to_string();
+        }
+        if secret.len() <= 8 {
+            return "*****".to_string();
+        }
+        format!("{}*****", &secret[..4])
+    }
+
+    pub fn masked_access_key(&self) -> String {
+        self.mask_secret(&self.access_key_id)
+    }
+
+    pub fn masked_secret_key(&self) -> String {
+        self.mask_secret(&self.secret_access_key)
+    }
 }
 
 #[derive(Default)]
@@ -172,7 +192,12 @@ impl SnapshotBrowser {
     }
 
     pub async fn verify_s3_settings(&self) -> Result<()> {
-        debug!("Verifying S3 settings");
+        debug!("Verifying S3 settings - Bucket: {}, Region: {}, Access Key: {}",
+            self.config.bucket,
+            self.config.region,
+            self.config.masked_access_key()
+        );
+
         if self.config.bucket.is_empty() {
             error!("S3 bucket name is empty");
             return Err(anyhow!("S3 bucket name is required"));
@@ -181,7 +206,7 @@ impl SnapshotBrowser {
             error!("AWS region is empty");
             return Err(anyhow!("AWS region is required"));
         }
-        if self.config.access_key_id.is_none() || self.config.secret_access_key.is_none() {
+        if self.config.access_key_id.is_empty() || self.config.secret_access_key.is_empty() {
             error!("AWS credentials are missing");
             return Err(anyhow!("AWS credentials are required"));
         }
@@ -193,7 +218,10 @@ impl SnapshotBrowser {
     }
 
     async fn init_s3_client(&mut self) -> Result<()> {
-        info!("Initializing S3 client with region: {}", self.config.region);
+        info!("Initializing S3 client with region: {}, access key: {}", 
+            self.config.region,
+            self.config.masked_access_key()
+        );
         if let Err(e) = self.verify_s3_settings().await {
             error!("Failed to verify S3 settings: {}", e);
             self.set_error(Some(format!("Error: {}", e)));
@@ -204,22 +232,27 @@ impl SnapshotBrowser {
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(self.config.region.clone()));
 
-        if let Some(endpoint) = &self.config.endpoint_url {
-            debug!("Using custom endpoint URL: {}", endpoint);
-            config_loader = config_loader.endpoint_url(endpoint);
+        if !self.config.endpoint_url.is_empty() {
+            debug!("Using custom endpoint URL: {}", self.config.endpoint_url);
+            config_loader = config_loader.endpoint_url(&self.config.endpoint_url);
         }
 
-        if let Some(access_key_id) = &self.config.access_key_id {
+        if !self.config.access_key_id.is_empty() {
             debug!("Using provided access key ID");
-            if let Some(secret_access_key) = &self.config.secret_access_key {
+            if !self.config.secret_access_key.is_empty() {
+                let credentials = Credentials::new(
+                    &self.config.access_key_id,
+                    &self.config.secret_access_key,
+                    None,
+                    None,
+                    "postgres-manager",
+                );
+                debug!("Using credentials - Access Key: {}, Secret Key: {}",
+                    self.config.masked_access_key(),
+                    self.config.masked_secret_key()
+                );
                 config_loader = config_loader
-                    .credentials_provider(Credentials::new(
-                        access_key_id,
-                        secret_access_key,
-                        None,
-                        None,
-                        "Custom",
-                    ));
+                    .credentials_provider(credentials);
             }
         }
 
@@ -351,9 +384,9 @@ pub async fn run_tui(
             bucket: bucket.unwrap_or_default(),
             region: region.unwrap_or_else(|| "us-west-2".to_string()),
             prefix: prefix.unwrap_or_default(),
-            endpoint_url,
-            access_key_id,
-            secret_access_key,
+            endpoint_url: endpoint_url.unwrap_or_default(),
+            access_key_id: access_key_id.unwrap_or_default(),
+            secret_access_key: secret_access_key.unwrap_or_default(),
             path_style,
             error_message: None,
         },
@@ -466,9 +499,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::Bucket => browser.config.bucket.clone(),
                             FocusField::Region => browser.config.region.clone(),
                             FocusField::Prefix => browser.config.prefix.clone(),
-                            FocusField::EndpointUrl => browser.config.endpoint_url.clone().unwrap_or_default(),
-                            FocusField::AccessKeyId => browser.config.access_key_id.clone().unwrap_or_default(),
-                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone().unwrap_or_default(),
+                            FocusField::EndpointUrl => browser.config.endpoint_url.clone(),
+                            FocusField::AccessKeyId => browser.config.access_key_id.clone(),
+                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone(),
                             FocusField::PathStyle => browser.config.path_style.to_string(),
                             FocusField::PgHost => browser.pg_config.host.clone().unwrap_or_default(),
                             FocusField::PgPort => browser.pg_config.port.map(|p| p.to_string()).unwrap_or_default(),
@@ -523,9 +556,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::Bucket => browser.config.bucket.clone(),
                             FocusField::Region => browser.config.region.clone(),
                             FocusField::Prefix => browser.config.prefix.clone(),
-                            FocusField::EndpointUrl => browser.config.endpoint_url.clone().unwrap_or_default(),
-                            FocusField::AccessKeyId => browser.config.access_key_id.clone().unwrap_or_default(),
-                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone().unwrap_or_default(),
+                            FocusField::EndpointUrl => browser.config.endpoint_url.clone(),
+                            FocusField::AccessKeyId => browser.config.access_key_id.clone(),
+                            FocusField::SecretAccessKey => browser.config.secret_access_key.clone(),
                             FocusField::PathStyle => browser.config.path_style.to_string(),
                             FocusField::PgHost => browser.pg_config.host.clone().unwrap_or_default(),
                             FocusField::PgPort => browser.pg_config.port.map(|p| p.to_string()).unwrap_or_default(),
@@ -613,28 +646,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::Bucket => browser.config.bucket = browser.input_buffer.clone(),
                             FocusField::Region => browser.config.region = browser.input_buffer.clone(),
                             FocusField::Prefix => browser.config.prefix = browser.input_buffer.clone(),
-                            FocusField::EndpointUrl => {
-                                browser.config.endpoint_url = if browser.input_buffer.is_empty() {
-                                    None
-                                } else {
-                                    Some(browser.input_buffer.clone())
-                                };
-                            }
-                            FocusField::AccessKeyId => {
-                                browser.config.access_key_id = if browser.input_buffer.is_empty() {
-                                    None
-                                } else {
-                                    Some(browser.input_buffer.clone())
-                                };
-                            }
-                            FocusField::SecretAccessKey => {
-
-                                browser.config.secret_access_key = if browser.input_buffer.is_empty() {
-                                    None
-                                } else {
-                                    Some(browser.input_buffer.clone())
-                                };
-                            }
+                            FocusField::EndpointUrl => browser.config.endpoint_url = browser.input_buffer.clone(),
+                            FocusField::AccessKeyId => browser.config.access_key_id = browser.input_buffer.clone(),
+                            FocusField::SecretAccessKey => browser.config.secret_access_key = browser.input_buffer.clone(),
                             FocusField::PathStyle => {
                                 browser.config.path_style = browser.input_buffer.to_lowercase() == "true";
                             }
@@ -859,24 +873,12 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
     ]);
     let endpoint_line = Line::from(vec![
         Span::raw("[E] Endpoint: "),
-        Span::styled(
-            browser.config.endpoint_url.as_deref().unwrap_or(""),
-            endpoint_style,
-        ),
+        Span::styled(&browser.config.endpoint_url, endpoint_style),
     ]);
 
-    fn mask_key(key: &str) -> String {
-        if key.len() <= 8 {
-            "*".repeat(key.len())
-        } else {
-            format!("{}.....{}",
-                &key[..4],
-                &key[key.len().saturating_sub(4)..]
-            )
-        }
-    }
+    
 
-    let masked_access_key = mask_key(browser.config.access_key_id.as_deref().unwrap_or(""));
+    let masked_access_key = browser.config.masked_access_key();
     let access_key_line = Line::from(vec![
         Span::raw("[a] Access Key ID: "),
         Span::styled(
@@ -885,7 +887,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         ),
     ]);
 
-    let masked_secret_key = mask_key(browser.config.secret_access_key.as_deref().unwrap_or(""));
+    let masked_secret_key = browser.config.masked_secret_key();
     let secret_key_line = Line::from(vec![
         Span::raw("[s] Secret Key: "),
         Span::styled(
@@ -943,7 +945,15 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         ),
     ]);
 
-    let masked_pg_password = mask_key(browser.pg_config.password.as_deref().unwrap_or(""));
+    let masked_pg_password = if let Some(ref pass) = browser.pg_config.password {
+        if pass.len() <= 8 {
+            "*****".to_string()
+        } else {
+            format!("{}*****", &pass[..4])
+        }
+    } else {
+        "not set".to_string()
+    };
     let password_line = Line::from(vec![
         Span::raw("[f] Password: "),
         Span::styled(
