@@ -70,6 +70,7 @@ pub enum FocusField {
 use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 use log::info;
 use humansize::{format_size, BINARY};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone)]
 pub struct BackupMetadata {
@@ -192,6 +193,7 @@ impl SnapshotBrowser {
     }
 
     async fn init_s3_client(&mut self) -> Result<()> {
+        info!("Initializing S3 client with region: {}", self.config.region);
         if let Err(e) = self.verify_s3_settings().await {
             error!("Failed to verify S3 settings: {}", e);
             self.set_error(Some(format!("Error: {}", e)));
@@ -235,7 +237,7 @@ impl SnapshotBrowser {
 
 
     pub async fn load_snapshots(&mut self) -> Result<()> {
-        debug!("Loading snapshots from bucket: {}", self.config.bucket);
+        info!("Loading S3 snapshots from bucket: {}, prefix: {}", self.config.bucket, self.config.prefix);
         if self.s3_client.is_none() {
             if let Err(e) = self.init_s3_client().await {
                 error!("Failed to initialize S3 client: {}", e);
@@ -286,33 +288,25 @@ impl SnapshotBrowser {
                         _ => None,
                     }
                 })
-                .collect();
-            debug!("Found {} snapshots in bucket", self.snapshots.len());
-            self.snapshots.sort_by(|a, b| a.key.cmp(&b.key)); // Sort alphabetically
-        }
-
-        if self.snapshots.is_empty() {
-            self.set_error(Some(format!("No snapshots found in bucket '{}'", self.config.bucket)));
+                .collect::<Vec<_>>();
+            
+            // Sort by last_modified in reverse order (newest first)
+            self.snapshots.sort_by(|a, b| b.last_modified.secs().cmp(&a.last_modified.secs()));
+            info!("Found {} snapshots", self.snapshots.len());
+            Ok(())
         } else {
-            self.set_error(None);
-            self.state.select(Some(0));
+            self.snapshots = Vec::new();
+            info!("No snapshots found in bucket: {}", self.config.bucket);
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn next(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i >= self.snapshots.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
+        if let Some(selected) = self.state.selected() {
+            if selected < self.snapshots.len().saturating_sub(1) {
+                self.state.select(Some(selected + 1));
             }
-            None => 0,
-        };
-        self.state.select(Some(i));
+        }
     }
 
     fn previous(&mut self) {
@@ -414,8 +408,12 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
         if let Event::Key(key) = event::read()? {
             match browser.input_mode {
                 InputMode::Normal => match key.code {
-                    KeyCode::Char('q') => return Ok(None),
+                    KeyCode::Char('q') => {
+                        debug!("User pressed 'q' to quit");
+                        return Ok(None);
+                    },
                     KeyCode::Char('t') => {
+                        debug!("User pressed 't' to test connection");
                         match browser.focus {
                             FocusField::Bucket | FocusField::Region | FocusField::Prefix |
                             FocusField::EndpointUrl | FocusField::AccessKeyId |
@@ -513,6 +511,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                     KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => browser.next(),
                     KeyCode::Up | KeyCode::Char('k') if browser.focus == FocusField::SnapshotList => browser.previous(),
                     KeyCode::Char('r') => {
+                        debug!("User pressed 'r' to refresh snapshots");
                         if let Err(e) = browser.load_snapshots().await {
                             error!("Failed to refresh snapshots: {}", e);
                         }
@@ -540,6 +539,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                     KeyCode::Char('y') => {
                         if browser.popup_state == PopupState::ConfirmRestore {
                             if let Some(snapshot) = browser.selected_snapshot().cloned() {
+                                info!("User confirmed restore of snapshot: {}", snapshot.key);
                                 // Create a temporary file
                                 let temp_dir = Builder::new().prefix("pg-backup-").tempdir()?;
                                 let temp_path = temp_dir.path().join("backup.sql");
@@ -574,23 +574,27 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                                 }
                                                 browser.temp_file = Some(temp_path_str.clone());
+                                                info!("Download completed successfully: {}", temp_path_str);
                                                 browser.popup_state = PopupState::Success("Download complete".to_string());
                                                 // Show success message briefly
                                                 terminal.draw(|f| ui(f, &mut browser))?;
                                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                                 return Ok(Some(temp_path_str));
                                             } else {
+                                                warn!("Could not determine file size for snapshot: {}", snapshot.key);
                                                 browser.popup_state = PopupState::Error("Could not determine file size".to_string());
                                                 return Ok(None);
                                             }
                                         }
                                         Err(e) => {
-                                            browser.popup_state = PopupState::Error(format!("Failed to download backup: {}", e));
+                                            error!("Failed to download snapshot {}: {}", snapshot.key, e);
+                                        browser.popup_state = PopupState::Error(format!("Failed to download backup: {}", e));
                                             return Ok(None);
                                         }
                                     }
                                 }
-                                browser.popup_state = PopupState::Error("S3 client not initialized".to_string());
+                                warn!("Download attempted but S3 client not initialized");
+                            browser.popup_state = PopupState::Error("S3 client not initialized".to_string());
                                 return Ok(None);
                             }
                             return Ok(None);
@@ -1000,9 +1004,14 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
             } else {
                 Style::default()
             };
-            let date = snapshot.last_modified.secs().to_string();
-            let size = format_size(snapshot.size as u64, BINARY);
-            let content = format!("{:<60} {} {}", snapshot.key, date, size);
+            let date = DateTime::<Utc>::from_timestamp(snapshot.last_modified.secs(), 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let content = format!("{:<60} {} {}", 
+                snapshot.key,
+                format_size(snapshot.size as u64, BINARY),
+                date
+            );
             ListItem::new(content).style(style)
         })
         .collect();
@@ -1061,14 +1070,14 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
                         &snapshot.key,
                         Style::default().add_modifier(Modifier::BOLD),
                     )]),
-                    Line::from(vec![Span::raw("Date: "), Span::styled(
-                        {
-                            snapshot.last_modified.secs().to_string()
-                        },
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )]),
                     Line::from(vec![Span::raw("Size: "), Span::styled(
                         format_size(snapshot.size as u64, BINARY),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]),
+                    Line::from(vec![Span::raw("Last Modified: "), Span::styled(
+                        DateTime::<Utc>::from_timestamp(snapshot.last_modified.secs(), 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                            .unwrap_or_else(|| "Unknown".to_string()),
                         Style::default().add_modifier(Modifier::BOLD),
                     )]),
                     Line::from(vec![]),
