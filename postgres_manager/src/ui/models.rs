@@ -63,7 +63,7 @@ pub struct BackupMetadata {
 #[derive(Debug, PartialEq)]
 pub enum PopupState {
     Hidden,
-    ConfirmRestore,
+    ConfirmRestore(BackupMetadata),
     Downloading(BackupMetadata, f32, f64),
     ConfirmCancel(BackupMetadata, f32, f64),
     TestS3Result(String),

@@ -433,7 +433,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                     // Show cancel confirmation
                                     browser.popup_state = PopupState::ConfirmCancel(snapshot.clone(), *progress, *rate);
                                 }
-                                PopupState::ConfirmRestore => {
+                                PopupState::ConfirmRestore(_snapshot) => {
                                     browser.popup_state = PopupState::Hidden;
                                 },
                                 PopupState::TestS3Result(_) | PopupState::TestPgResult(_) => {
@@ -449,7 +449,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             browser.temp_file = None; // Reset temp file
                         },
 
-                        KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmRestore) => {
+                        KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmRestore(_)) => {
                             if let Some(snapshot) = browser.selected_snapshot().cloned() {
                                 info!("User confirmed restore of snapshot: {}", snapshot.key);
                                 // Create a temporary file
@@ -473,7 +473,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                 // User denied cancel, resume download
                                 browser.popup_state = PopupState::Downloading(snapshot.clone(), *progress, *rate);
                             }
-                            PopupState::ConfirmRestore => {
+                            PopupState::ConfirmRestore(_snapshot) => {
                                 browser.popup_state = PopupState::Hidden;
                             }
                             _ => {
@@ -501,8 +501,8 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                         },
                         KeyCode::Enter => {
                             if browser.focus == FocusField::SnapshotList {
-                                if browser.selected_snapshot().is_some() {
-                                    browser.popup_state = PopupState::ConfirmRestore;
+                                if let Some(snapshot) = browser.selected_snapshot() {
+                                    browser.popup_state = PopupState::ConfirmRestore(snapshot.clone());
                                 }
                             }
                         },
@@ -617,7 +617,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                     InputMode::Editing => match key.code {
                         KeyCode::Enter => {
                             if browser.focus == FocusField::SnapshotList {
-                                browser.popup_state = PopupState::ConfirmRestore;
+                                if let Some(snapshot) = browser.selected_snapshot() {
+                                    browser.popup_state = PopupState::ConfirmRestore(snapshot.clone());
+                                }
                             } else {
                                 debug!("Enter key pressed, attempting to initialize S3 client");
                                 browser.input_mode = InputMode::Normal;

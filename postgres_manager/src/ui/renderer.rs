@@ -261,7 +261,7 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
         .title("Snapshots")
         .borders(Borders::ALL)
         .style(snapshot_style);
-    
+
     let snapshot_items: Vec<ListItem> = browser.snapshots
         .iter()
         .enumerate()
@@ -293,7 +293,7 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     let help_paragraph = Paragraph::new(help_text)
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
-    
+
     let help_rect = Rect::new(
         chunks[3].x,
         chunks[3].y + chunks[3].height - 1,
@@ -306,12 +306,12 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
 
     // Show popup if needed - render last to ensure they're on top
     match &browser.popup_state {
-        PopupState::ConfirmRestore => {
+        PopupState::ConfirmRestore(snapshot) => {
             let area = centered_rect(60, 5, f.size());
             // Clear the area where the popup will be rendered
             f.render_widget(ratatui::widgets::Clear, area);
             let popup = Paragraph::new(vec![
-                Line::from(vec![Span::raw("Are you sure you want to restore this backup?")]),
+                Line::from(vec![Span::raw(format!("Are you sure you want to restore this backup '{}'?", snapshot.key))]),
                 Line::from(vec![]),
                 Line::from(vec![Span::raw("Press 'y' to confirm, 'n' to cancel")]),
             ])
