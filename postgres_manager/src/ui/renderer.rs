@@ -96,13 +96,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let bucket_text = if browser.focus == FocusField::Bucket && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Bucket: {}", browser.input_buffer)
     } else {
         format!("Bucket: {}", browser.config.bucket)
     };
-    
+
     let bucket = Paragraph::new(bucket_text)
         .style(bucket_style);
     f.render_widget(bucket, s3_settings_chunks[0]);
@@ -117,13 +117,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let region_text = if browser.focus == FocusField::Region && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Region: {}", browser.input_buffer)
     } else {
         format!("Region: {}", browser.config.region)
     };
-    
+
     let region = Paragraph::new(region_text)
         .style(region_style);
     f.render_widget(region, s3_settings_chunks[1]);
@@ -138,13 +138,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let prefix_text = if browser.focus == FocusField::Prefix && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Prefix: {}", browser.input_buffer)
     } else {
         format!("Prefix: {}", browser.config.prefix)
     };
-    
+
     let prefix = Paragraph::new(prefix_text)
         .style(prefix_style);
     f.render_widget(prefix, s3_settings_chunks[2]);
@@ -159,13 +159,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let endpoint_text = if browser.focus == FocusField::EndpointUrl && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Endpoint URL: {}", browser.input_buffer)
     } else {
         format!("Endpoint URL: {}", browser.config.endpoint_url)
     };
-    
+
     let endpoint = Paragraph::new(endpoint_text)
         .style(endpoint_style);
     f.render_widget(endpoint, s3_settings_chunks[3]);
@@ -180,13 +180,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let access_key_text = if browser.focus == FocusField::AccessKeyId && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Access Key ID: {}", browser.input_buffer)
     } else {
         format!("Access Key ID: {}", browser.config.masked_access_key())
     };
-    
+
     let access_key = Paragraph::new(access_key_text)
         .style(access_key_style);
     f.render_widget(access_key, s3_settings_chunks[4]);
@@ -201,13 +201,13 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
     } else {
         Style::default()
     };
-    
+
     let secret_key_text = if browser.focus == FocusField::SecretAccessKey && browser.input_mode == crate::ui::models::InputMode::Editing {
         format!("Secret Access Key: {}", browser.input_buffer)
     } else {
         format!("Secret Access Key: {}", browser.config.masked_secret_key())
     };
-    
+
     let secret_key = Paragraph::new(secret_key_text)
         .style(secret_key_style);
     f.render_widget(secret_key, s3_settings_chunks[5]);
@@ -487,11 +487,11 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             .block(error_block);
         f.render_widget(error_paragraph, chunks[3]);
     }
-    
+
     // If in editing mode, render an editing indicator at the highest z-layer
     if browser.input_mode == crate::ui::models::InputMode::Editing {
         // Create a floating box for the editing field
-        let field_area = match browser.focus {
+        let mut field_area = match browser.focus {
             FocusField::Bucket => s3_settings_chunks[0],
             FocusField::Region => s3_settings_chunks[1],
             FocusField::Prefix => s3_settings_chunks[2],
@@ -507,10 +507,18 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             FocusField::PgDbName => pg_settings_chunks[5],
             _ => return,
         };
-        
-        // Clear the area first to ensure our input field is visible
+
+        // Make the field area slightly larger to ensure it stands out
+        field_area = Rect {
+            x: field_area.x.saturating_sub(1),
+            y: field_area.y.saturating_sub(1),
+            width: field_area.width + 2,
+            height: field_area.height + 2,
+        };
+
+        // Clear a larger area around the field to ensure our input field is visible
         f.render_widget(Clear, field_area);
-        
+
         // Create a floating input box with border
         let input_content = match browser.focus {
             FocusField::Bucket => browser.input_buffer.clone(),
@@ -528,7 +536,7 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             FocusField::PgDbName => browser.input_buffer.clone(),
             _ => String::new(),
         };
-        
+
         // Get the field label
         let field_label = match browser.focus {
             FocusField::Bucket => "Bucket",
@@ -546,16 +554,19 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             FocusField::PgDbName => "Database Name",
             _ => "",
         };
-        
+
+        // Create a more prominent input box with a double border and background color
         let input_box = Paragraph::new(input_content)
-            .style(Style::default().fg(Color::Green))
+            .style(Style::default().fg(Color::Green).bg(Color::Black))
             .block(Block::default()
-                .title(format!("Editing {}", field_label))
+                .title(format!(" Editing {} ", field_label))
+                .title_style(Style::default().fg(Color::Green).bg(Color::Black).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Double)
                 .border_style(Style::default().fg(Color::Green)));
-        
+
         f.render_widget(input_box, field_area);
-        
+
         // Create a small area for the editing mode indicator at the top of the screen
         let indicator_area = Rect {
             x: f.size().width - 20,
@@ -563,7 +574,7 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             width: 20,
             height: 1,
         };
-        
+
         // Render the editing indicator
         let editing_indicator = Paragraph::new("EDITING MODE")
             .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
