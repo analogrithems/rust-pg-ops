@@ -1,5 +1,5 @@
 mod backup;
-mod tui;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, command, arg};
@@ -8,15 +8,8 @@ use tokio_postgres::Config as PgConfig;
 use tokio_postgres::config::SslMode;
 use log::{error, info, warn, LevelFilter};
 use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
-use crate::tui::{SnapshotBrowser, S3Config, PostgresConfig};
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
-use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
-use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use std::io;
 
 #[derive(Parser)]
@@ -331,39 +324,16 @@ async fn main() -> Result<()> {
             }
         }
         Commands::BrowseSnapshots => {
-            enable_raw_mode()?;
-            let mut stdout = io::stdout();
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-            let backend = CrosstermBackend::new(stdout);
-            let mut terminal = Terminal::new(backend)?;
-
-            let browser = SnapshotBrowser::new(
-                S3Config {
-                    bucket: cli.bucket.unwrap_or_default(),
-                    region: cli.region.unwrap_or_default(),
-                    prefix: cli.prefix.unwrap_or_default(),
-                    endpoint_url: cli.endpoint_url.unwrap_or_default(),
-                    access_key_id: cli.access_key_id.unwrap_or_default(),
-                    secret_access_key: cli.secret_access_key.unwrap_or_default(),
-                    path_style: true,
-                    error_message: None,
-                },
-                PostgresConfig {
-                    host: cli.host.clone(),
-                    port: cli.port,
-                    username: cli.username.clone(),
-                    password: cli.password.clone(),
-                    use_ssl: cli.use_ssl,
-                    db_name: cli.db_name.clone(),
-                },
-            );
-
-            let res = tui::run_app(&mut terminal, browser).await?;
-
-            // restore terminal
-            disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-            terminal.show_cursor()?;
+            // Use the new UI module to browse snapshots
+            let res = ui::run_tui(
+                cli.bucket,
+                cli.region,
+                cli.prefix,
+                cli.endpoint_url,
+                cli.access_key_id,
+                cli.secret_access_key,
+                true, // path_style
+            ).await?;
 
             if let Some(snapshot_key) = res {
                 // Handle the selected snapshot

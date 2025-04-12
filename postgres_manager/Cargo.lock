@@ -2187,6 +2187,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "futures-util",
  "humansize",
  "log",
  "log4rs",
