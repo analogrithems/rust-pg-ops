@@ -1,0 +1,22 @@
+---
+source: tests/browser_tests.rs
+expression: pg_config
+---
+PostgresConfig {
+    host: Some(
+        "localhost",
+    ),
+    port: Some(
+        5432,
+    ),
+    username: Some(
+        "postgres",
+    ),
+    password: Some(
+        "password",
+    ),
+    use_ssl: false,
+    db_name: Some(
+        "postgres",
+    ),
+}

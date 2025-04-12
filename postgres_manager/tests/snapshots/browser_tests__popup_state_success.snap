@@ -1,0 +1,7 @@
+---
+source: tests/browser_tests.rs
+expression: success
+---
+Success(
+    "Test success message",
+)

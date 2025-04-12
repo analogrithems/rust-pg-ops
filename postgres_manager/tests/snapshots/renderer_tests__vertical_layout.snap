@@ -1,0 +1,30 @@
+---
+source: tests/renderer_tests.rs
+expression: vertical_layout
+---
+[
+    Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 3,
+    },
+    Rect {
+        x: 0,
+        y: 3,
+        width: 100,
+        height: 9,
+    },
+    Rect {
+        x: 0,
+        y: 12,
+        width: 100,
+        height: 8,
+    },
+    Rect {
+        x: 0,
+        y: 20,
+        width: 100,
+        height: 30,
+    },
+]

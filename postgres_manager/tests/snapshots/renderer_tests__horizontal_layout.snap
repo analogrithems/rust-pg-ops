@@ -1,0 +1,24 @@
+---
+source: tests/renderer_tests.rs
+expression: horizontal_layout
+---
+[
+    Rect {
+        x: 0,
+        y: 0,
+        width: 30,
+        height: 50,
+    },
+    Rect {
+        x: 30,
+        y: 0,
+        width: 40,
+        height: 50,
+    },
+    Rect {
+        x: 70,
+        y: 0,
+        width: 30,
+        height: 50,
+    },
+]

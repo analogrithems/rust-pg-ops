@@ -1,0 +1,10 @@
+---
+source: tests/renderer_tests.rs
+expression: rect1
+---
+Rect {
+    x: 20,
+    y: 18,
+    width: 60,
+    height: 10,
+}

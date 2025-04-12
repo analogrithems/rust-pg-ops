@@ -1,0 +1,42 @@
+---
+source: tests/renderer_tests.rs
+expression: pg_settings_chunks
+---
+[
+    Rect {
+        x: 1,
+        y: 13,
+        width: 98,
+        height: 1,
+    },
+    Rect {
+        x: 1,
+        y: 14,
+        width: 98,
+        height: 1,
+    },
+    Rect {
+        x: 1,
+        y: 15,
+        width: 98,
+        height: 1,
+    },
+    Rect {
+        x: 1,
+        y: 16,
+        width: 98,
+        height: 1,
+    },
+    Rect {
+        x: 1,
+        y: 17,
+        width: 98,
+        height: 1,
+    },
+    Rect {
+        x: 1,
+        y: 18,
+        width: 98,
+        height: 1,
+    },
+]

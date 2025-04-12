@@ -1,8 +1,9 @@
 use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 use std::fmt;
+use std::fmt::Debug;
 
 /// Configuration for S3 connection
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -34,7 +35,7 @@ impl S3Config {
 }
 
 /// Configuration for PostgreSQL connection
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PostgresConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
