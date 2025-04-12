@@ -10,7 +10,7 @@ use log::{error, info, warn, LevelFilter};
 use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
-use std::io;
+
 
 #[derive(Parser)]
 #[command(name = "postgres_manager")]
