@@ -91,8 +91,9 @@ use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 use log::info;
 use humansize::{format_size, BINARY};
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackupMetadata {
     pub key: String,
     pub size: i64,
@@ -103,7 +104,8 @@ pub struct BackupMetadata {
 pub enum PopupState {
     Hidden,
     ConfirmRestore,
-    Downloading(f32),  // Added state for download progress (0.0 to 1.0)
+    Downloading(BackupMetadata, f32, f64),  // (snapshot, progress, bytes_per_sec)
+    ConfirmCancel(BackupMetadata, f32, f64), // Same data as Downloading for resuming if cancel is denied
     Error(String),
     Success(String),
     TestS3Result(String),
@@ -125,10 +127,113 @@ pub struct SnapshotBrowser {
 
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use std::path::Path;
 
 use tempfile::Builder;
 
 impl SnapshotBrowser {
+    async fn download_snapshot<B: Backend>(&mut self, snapshot: &BackupMetadata, terminal: &mut Terminal<B>, temp_path: &Path) -> Result<Option<String>> {
+        let temp_path_str = temp_path.to_string_lossy().to_string();
+        
+        // Start download
+        self.popup_state = PopupState::Downloading(snapshot.clone(), 0.0, 0.0);
+        self.temp_file = Some(temp_path_str.clone());
+
+        // Track download rate
+        let mut last_update = std::time::Instant::now();
+        let mut last_bytes = 0u64;
+        let mut current_rate = 0.0;
+
+        // Begin downloading the file
+        if let Some(client) = &self.s3_client {
+            let get_obj = client.get_object()
+                .bucket(&self.config.bucket)
+                .key(&snapshot.key)
+                .send()
+                .await;
+
+            match get_obj {
+                Ok(resp) => {
+                    if let Some(total_size) = resp.content_length() {
+                        let mut file = File::create(&temp_path).await?;
+                        let mut stream = resp.body;
+                        let mut downloaded: u64 = 0;
+
+                        while let Some(chunk) = stream.try_next().await? {
+                            file.write_all(&chunk).await?;
+                            downloaded += chunk.len() as u64;
+                            let progress = downloaded as f32 / total_size as f32;
+
+                            // Calculate download rate
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(last_update).as_secs_f64();
+                            if elapsed >= 0.5 { // Update rate every 0.5 seconds
+                                let bytes_since_last = downloaded - last_bytes;
+                                current_rate = bytes_since_last as f64 / elapsed;
+                                last_update = now;
+                                last_bytes = downloaded;
+                            }
+
+                            // Check for user input (like ESC key) during download
+                            if event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                                if let Event::Key(key) = event::read().unwrap_or(Event::Key(event::KeyEvent::new(KeyCode::Null, event::KeyModifiers::NONE))) {
+                                    if key.code == KeyCode::Esc {
+                                        debug!("User pressed ESC to cancel download during chunk processing");
+                                        self.popup_state = PopupState::ConfirmCancel(snapshot.clone(), progress, current_rate);
+                                        terminal.draw(|f| ui(f, self))?;
+                                        continue;
+                                    }
+                                }
+                            }
+                            
+                            match &self.popup_state {
+                                PopupState::ConfirmCancel(..) => {
+                                    // Wait for user confirmation
+                                    terminal.draw(|f| ui(f, self))?;
+                                    continue;
+                                },
+                                PopupState::Hidden => {
+                                    // Download was cancelled and confirmed
+                                    debug!("Download cancelled by user");
+                                    file.flush().await?;
+                                    self.temp_file = None; // Reset temp file
+                                    return Ok(None);
+                                },
+                                _ => {
+                                    // Continue downloading
+                                    self.popup_state = PopupState::Downloading(snapshot.clone(), progress, current_rate);
+                                }
+                            }
+                            // Force a redraw to show progress
+                            terminal.draw(|f| ui(f, self))?;
+                            // Small delay to allow UI updates
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        self.temp_file = Some(temp_path_str.clone());
+                        info!("Download completed successfully: {}", temp_path_str);
+                        self.popup_state = PopupState::Success("Download complete".to_string());
+                        // Show success message briefly
+                        terminal.draw(|f| ui(f, self))?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        return Ok(Some(temp_path_str));
+                    } else {
+                        warn!("Could not determine file size for snapshot: {}", snapshot.key);
+                        self.popup_state = PopupState::Error("Could not determine file size".to_string());
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to download snapshot {}: {}", snapshot.key, e);
+                    self.popup_state = PopupState::Error(format!("Failed to download backup: {}", e));
+                    return Ok(None);
+                }
+            }
+        } else {
+            warn!("Download attempted but S3 client not initialized");
+            self.popup_state = PopupState::Error("S3 client not initialized".to_string());
+            return Ok(None);
+        }
+    }
     pub async fn test_s3_connection(&mut self) -> Result<()> {
         if self.s3_client.is_none() {
             if let Err(e) = self.init_s3_client().await {
@@ -218,7 +323,7 @@ impl SnapshotBrowser {
     }
 
     async fn init_s3_client(&mut self) -> Result<()> {
-        info!("Initializing S3 client with region: {}, access key: {}", 
+        info!("Initializing S3 client with region: {}, access key: {}",
             self.config.region,
             self.config.masked_access_key()
         );
@@ -322,7 +427,7 @@ impl SnapshotBrowser {
                     }
                 })
                 .collect::<Vec<_>>();
-            
+
             // Sort by last_modified in reverse order (newest first)
             self.snapshots.sort_by(|a, b| b.last_modified.secs().cmp(&a.last_modified.secs()));
             info!("Found {} snapshots", self.snapshots.len());
@@ -445,6 +550,60 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                         debug!("User pressed 'q' to quit");
                         return Ok(None);
                     },
+                    KeyCode::Esc => {
+                        match &browser.popup_state {
+                            PopupState::Downloading(snapshot, progress, rate) => {
+                                debug!("User pressed ESC to cancel download");
+                                // Show cancel confirmation
+                                browser.popup_state = PopupState::ConfirmCancel(snapshot.clone(), *progress, *rate);
+                            }
+                            PopupState::ConfirmRestore => {
+                                browser.popup_state = PopupState::Hidden;
+                            },
+                            PopupState::TestS3Result(_) | PopupState::TestPgResult(_) => {
+                                browser.popup_state = PopupState::Hidden;
+                            }
+                            _ => {}
+                        }
+                    },
+                    KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmCancel(..)) => {
+                        debug!("User confirmed download cancel");
+                        // User confirmed cancel
+                        browser.popup_state = PopupState::Hidden;
+                        browser.temp_file = None; // Reset temp file
+                    },
+
+                    KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmRestore) => {
+                        if let Some(snapshot) = browser.selected_snapshot().cloned() {
+                            info!("User confirmed restore of snapshot: {}", snapshot.key);
+                            // Create a temporary file
+                            let temp_dir = Builder::new().prefix("pg-backup-").tempdir()?;
+                            let temp_path = temp_dir.path().join("backup.sql");
+                            
+                            // Start download
+                            match browser.download_snapshot(&snapshot, terminal, &temp_path).await {
+                                Ok(Some(downloaded_path)) => return Ok(Some(downloaded_path)),
+                                Ok(None) => {},  // Download was cancelled or failed
+                                Err(e) => {
+                                    error!("Error during download: {}", e);
+                                    browser.popup_state = PopupState::Error(format!("Download error: {}", e));
+                                }
+                            }
+                        }
+                    },
+                    KeyCode::Char('n') => match &browser.popup_state {
+                        PopupState::ConfirmCancel(snapshot, progress, rate) => {
+                            debug!("User denied download cancel");
+                            // User denied cancel, resume download
+                            browser.popup_state = PopupState::Downloading(snapshot.clone(), *progress, *rate);
+                        }
+                        PopupState::ConfirmRestore => {
+                            browser.popup_state = PopupState::Hidden;
+                        }
+                        _ => {
+                            browser.focus = FocusField::PgDbName;
+                        }
+                    },
                     KeyCode::Char('t') => {
                         debug!("User pressed 't' to test connection");
                         match browser.focus {
@@ -470,7 +629,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                 browser.popup_state = PopupState::ConfirmRestore;
                             }
                         }
-                    }
+                    },
                     KeyCode::Tab => {
                         browser.focus = match browser.focus {
                             FocusField::SnapshotList => FocusField::Bucket,
@@ -489,13 +648,13 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::PgPassword => FocusField::PgSsl,
                             FocusField::PgSsl => FocusField::PgDbName,
                             FocusField::PgDbName => FocusField::SnapshotList,
-
                         };
-                    }
+                    },
                     // Edit mode
                     KeyCode::Char('e') if browser.focus != FocusField::SnapshotList => {
                         browser.input_mode = InputMode::Editing;
                         browser.input_buffer = match browser.focus {
+                            FocusField::SnapshotList => String::new(),
                             FocusField::Bucket => browser.config.bucket.clone(),
                             FocusField::Region => browser.config.region.clone(),
                             FocusField::Prefix => browser.config.prefix.clone(),
@@ -508,51 +667,59 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::PgUsername => browser.pg_config.username.clone().unwrap_or_default(),
                             FocusField::PgPassword => browser.pg_config.password.clone().unwrap_or_default(),
                             FocusField::PgSsl => browser.pg_config.use_ssl.to_string(),
-                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default(),
-                            _ => String::new(),
+                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default()
                         };
-                    }
+                    },
+                    // S3 Settings shortcuts
+                    KeyCode::Char('b') if browser.input_mode == InputMode::Normal => browser.focus = FocusField::Bucket,
+                    KeyCode::Char('R') if browser.input_mode == InputMode::Normal => browser.focus = FocusField::Region,
+                    KeyCode::Char('x') if browser.input_mode == InputMode::Normal => browser.focus = FocusField::Prefix,
+                    // Navigation shortcuts
+                    KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => {
+                        browser.next();
+                    },
+                    KeyCode::Up | KeyCode::Char('k') if browser.focus == FocusField::SnapshotList => {
+                        browser.previous();
+                    },
+                    // S3 Settings shortcuts
+                    KeyCode::Char('E') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::EndpointUrl;
+                    },
+                    KeyCode::Char('a') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::AccessKeyId;
+                    },
+                    KeyCode::Char('s') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::SecretAccessKey;
+                    },
+                    // PostgreSQL Settings shortcuts
+                    KeyCode::Char('h') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::PgHost;
+                    },
+                    KeyCode::Char('p') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::PgPort;
+                    },
+                    KeyCode::Char('u') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::PgUsername;
+                    },
+                    KeyCode::Char('f') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::PgPassword;
+                    },
+                    KeyCode::Char('l') if browser.input_mode == InputMode::Normal => {
+                        browser.focus = FocusField::PgSsl;
+                    },
+                    // State management
 
-                    // S3 Settings shortcuts (1-7)
-                    KeyCode::Char('b') => browser.focus = FocusField::Bucket,
-                    KeyCode::Char('R') => browser.focus = FocusField::Region,
-                    KeyCode::Char('x') => browser.focus = FocusField::Prefix,
-                    KeyCode::Char('E') => browser.focus = FocusField::EndpointUrl,
-                    KeyCode::Char('a') => browser.focus = FocusField::AccessKeyId,
-                    KeyCode::Char('s') => browser.focus = FocusField::SecretAccessKey,
-                    // PostgreSQL Settings shortcuts (a-h)
-                    KeyCode::Char('h') => browser.focus = FocusField::PgHost,
-                    KeyCode::Char('p') => browser.focus = FocusField::PgPort,
-                    KeyCode::Char('u') => browser.focus = FocusField::PgUsername,
-                    KeyCode::Char('f') => browser.focus = FocusField::PgPassword,
-                    KeyCode::Char('l') => browser.focus = FocusField::PgSsl,
-                    KeyCode::Char('n') => {
-                        if browser.popup_state == PopupState::ConfirmRestore {
-                            browser.popup_state = PopupState::Hidden;
-                        } else {
-                            browser.focus = FocusField::PgDbName;
-                        }
-                    },
-                    KeyCode::Esc => {
-                        match browser.popup_state {
-                            PopupState::TestS3Result(_) | PopupState::TestPgResult(_) | PopupState::ConfirmRestore => {
-                                browser.popup_state = PopupState::Hidden;
-                            },
-                            _ => {}
-                        }
-                    },
-                    KeyCode::Down | KeyCode::Char('j') if browser.focus == FocusField::SnapshotList => browser.next(),
-                    KeyCode::Up | KeyCode::Char('k') if browser.focus == FocusField::SnapshotList => browser.previous(),
                     KeyCode::Char('r') => {
                         debug!("User pressed 'r' to refresh snapshots");
                         if let Err(e) = browser.load_snapshots().await {
-                            error!("Failed to refresh snapshots: {}", e);
+                            browser.popup_state = PopupState::Error(format!("Error: {}", e));
                         }
                     },
                     KeyCode::Char('e') => {
                         browser.input_mode = InputMode::Editing;
                         // Pre-populate input buffer with current value based on focus
                         browser.input_buffer = match browser.focus {
+                            FocusField::SnapshotList => String::new(),
                             FocusField::Bucket => browser.config.bucket.clone(),
                             FocusField::Region => browser.config.region.clone(),
                             FocusField::Prefix => browser.config.prefix.clone(),
@@ -565,74 +732,28 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                             FocusField::PgUsername => browser.pg_config.username.clone().unwrap_or_default(),
                             FocusField::PgPassword => browser.pg_config.password.clone().unwrap_or_default(),
                             FocusField::PgSsl => browser.pg_config.use_ssl.to_string(),
-                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default(),
-                            _ => String::new(),
+                            FocusField::PgDbName => browser.pg_config.db_name.clone().unwrap_or_default()
                         };
                     },
-                    KeyCode::Char('y') => {
-                        if browser.popup_state == PopupState::ConfirmRestore {
-                            if let Some(snapshot) = browser.selected_snapshot().cloned() {
-                                info!("User confirmed restore of snapshot: {}", snapshot.key);
-                                // Create a temporary file
-                                let temp_dir = Builder::new().prefix("pg-backup-").tempdir()?;
-                                let temp_path = temp_dir.path().join("backup.sql");
-                                let temp_path_str = temp_path.to_string_lossy().to_string();
-
-                                // Start download
-                                browser.popup_state = PopupState::Downloading(0.0);
-
-                                // Begin downloading the file
-                                if let Some(client) = &browser.s3_client {
-                                    let get_obj = client.get_object()
-                                        .bucket(&browser.config.bucket)
-                                        .key(&snapshot.key)
-                                        .send()
-                                        .await;
-
-                                    match get_obj {
-                                        Ok(resp) => {
-                                            if let Some(total_size) = resp.content_length() {
-                                                let mut file = File::create(&temp_path).await?;
-                                                let mut stream = resp.body;
-                                                let mut downloaded: u64 = 0;
-
-                                                while let Some(chunk) = stream.try_next().await? {
-                                                    file.write_all(&chunk).await?;
-                                                    downloaded += chunk.len() as u64;
-                                                    let progress = downloaded as f32 / total_size as f32;
-                                                    browser.popup_state = PopupState::Downloading(progress);
-                                                    // Force a redraw to show progress
-                                                    terminal.draw(|f| ui(f, &mut browser))?;
-                                                    // Small delay to allow UI updates
-                                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                                }
-                                                browser.temp_file = Some(temp_path_str.clone());
-                                                info!("Download completed successfully: {}", temp_path_str);
-                                                browser.popup_state = PopupState::Success("Download complete".to_string());
-                                                // Show success message briefly
-                                                terminal.draw(|f| ui(f, &mut browser))?;
-                                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                                return Ok(Some(temp_path_str));
-                                            } else {
-                                                warn!("Could not determine file size for snapshot: {}", snapshot.key);
-                                                browser.popup_state = PopupState::Error("Could not determine file size".to_string());
-                                                return Ok(None);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to download snapshot {}: {}", snapshot.key, e);
-                                        browser.popup_state = PopupState::Error(format!("Failed to download backup: {}", e));
-                                            return Ok(None);
-                                        }
-                                    }
+                    KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmRestore) => {
+                        if let Some(snapshot) = browser.selected_snapshot().cloned() {
+                            info!("User confirmed restore of snapshot: {}", snapshot.key);
+                            // Create a temporary file
+                            let temp_dir = Builder::new().prefix("pg-backup-").tempdir()?;
+                            let temp_path = temp_dir.path().join("backup.sql");
+                            
+                            // Start download
+                            match browser.download_snapshot(&snapshot, terminal, &temp_path).await {
+                                Ok(Some(downloaded_path)) => return Ok(Some(downloaded_path)),
+                                Ok(None) => {},  // Download was cancelled or failed
+                                Err(e) => {
+                                    error!("Error during download: {}", e);
+                                    browser.popup_state = PopupState::Error(format!("Download error: {}", e));
                                 }
-                                warn!("Download attempted but S3 client not initialized");
-                            browser.popup_state = PopupState::Error("S3 client not initialized".to_string());
-                                return Ok(None);
                             }
-                            return Ok(None);
                         }
-                    }
+                    },
+                    // Handle any unmatched key
                     _ => {}
                 },
                 InputMode::Editing => match key.code {
@@ -876,7 +997,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
         Span::styled(&browser.config.endpoint_url, endpoint_style),
     ]);
 
-    
+
 
     let masked_access_key = browser.config.masked_access_key();
     let access_key_line = Line::from(vec![
@@ -1017,7 +1138,7 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
             let date = DateTime::<Utc>::from_timestamp(snapshot.last_modified.secs(), 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
-            let content = format!("{:<60} {} {}", 
+            let content = format!("{:<60} {} {}",
                 snapshot.key,
                 format_size(snapshot.size as u64, BINARY),
                 date
@@ -1099,19 +1220,63 @@ fn ui(f: &mut Frame, browser: &mut SnapshotBrowser) {
                 f.render_widget(popup.block(Block::default().title("Confirm Restore").borders(Borders::ALL)), area);
             }
         }
-        PopupState::Downloading(progress) => {
-            let area = centered_rect(60, 5, f.size());
+        PopupState::Downloading(snapshot, progress, bytes_per_sec) => {
+            let area = centered_rect(60, 11, f.size());
             f.render_widget(Clear, area);
+            let date = DateTime::<Utc>::from_timestamp(snapshot.last_modified.secs(), 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            // Calculate time remaining
+            let bytes_remaining = (snapshot.size as f64) * (1.0 - (*progress) as f64);
+            let bytes_per_sec = *bytes_per_sec;
+            let seconds_remaining = if bytes_per_sec >= 0.000001 { // Avoid division by very small numbers
+                bytes_remaining / bytes_per_sec
+            } else {
+                0.0
+            };
+            let time_remaining = if bytes_per_sec >= 0.000001 {
+                format!("{:.0}s remaining", seconds_remaining)
+            } else {
+                "calculating...".to_string()
+            };
+
             let popup = Paragraph::new(vec![
-                Line::from(vec![Span::raw("Downloading snapshot...")]),
+                Line::from(vec![Span::raw("Downloading snapshot:")]),
+                Line::from(vec![Span::styled(
+                    &snapshot.key,
+                    Style::default().add_modifier(Modifier::BOLD)
+                )]),
+                Line::from(vec![Span::raw(format!("Size: {}", format_size(snapshot.size as u64, BINARY)))]),
+                Line::from(vec![Span::raw(format!("Last Modified: {}", date))]),
                 Line::from(vec![Span::raw("")]),
                 Line::from(vec![Span::raw(format!("[{}>{} ]",
                     "=".repeat((progress * 50.0) as usize),
                     " ".repeat((50.0 - progress * 50.0) as usize)
                 ))]),
-                Line::from(vec![Span::raw(format!("{}%", (progress * 100.0) as u32))]),
+                Line::from(vec![Span::raw(format!("{:.1}% - {}/s - {}",
+                    progress * 100.0,
+                    format_size(bytes_per_sec.round() as u64, BINARY),
+                    time_remaining
+                ))]),
+                Line::from(vec![Span::raw("")]),
+                Line::from(vec![Span::raw("Press 'ESC' to cancel")]),
             ])
             .block(Block::default().title("Download Progress").borders(Borders::ALL))
+            .alignment(Alignment::Center);
+            f.render_widget(popup, area);
+        }
+        PopupState::ConfirmCancel(_snapshot, progress, _bytes_per_sec) => {
+            let area = centered_rect(50, 7, f.size());
+            f.render_widget(Clear, area);
+            let popup = Paragraph::new(vec![
+                Line::from(vec![Span::raw("Are you sure you want to cancel the download?")]),
+                Line::from(vec![Span::raw("")]),
+                Line::from(vec![Span::raw(format!("Current progress: {:.1}%", progress * 100.0))]),
+                Line::from(vec![Span::raw("")]),
+                Line::from(vec![Span::raw("Press 'y' to confirm or 'n' to continue downloading")]),
+            ])
+            .block(Block::default().title("Confirm Cancel").borders(Borders::ALL))
             .alignment(Alignment::Center);
             f.render_widget(popup, area);
         }
