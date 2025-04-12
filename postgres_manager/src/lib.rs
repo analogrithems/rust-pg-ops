@@ -1,5 +1,7 @@
-// Export the UI module for testing
+// Export modules for testing and usage
 pub mod ui;
+pub mod config;
+pub mod backup;
 
 // Re-export other modules as needed
 pub use crate::ui::browser::run_tui;

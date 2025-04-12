@@ -1,5 +1,4 @@
-mod backup;
-mod ui;
+use postgres_manager::{backup, ui, config};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, command, arg};
@@ -246,6 +245,10 @@ async fn main() -> Result<()> {
 
     log4rs::init_config(log_config)?;
     info!("Starting postgres_manager");
+    
+    // Load environment variables from .env file
+    config::load_env();
+    info!("Loaded environment variables");
 
     let cli: Cli = Cli::parse();
     let client = connect(&cli).await?;

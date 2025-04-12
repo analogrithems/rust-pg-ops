@@ -25,6 +25,23 @@ pub struct SnapshotBrowser {
     pub temp_file: Option<String>,
 }
 
+impl std::fmt::Debug for SnapshotBrowser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotBrowser")
+            .field("config", &self.config)
+            .field("pg_config", &self.pg_config)
+            .field("s3_client", &"<S3Client>")
+            .field("snapshots", &self.snapshots)
+            .field("selected_idx", &self.selected_idx)
+            .field("input_mode", &self.input_mode)
+            .field("input_buffer", &self.input_buffer)
+            .field("focus", &self.focus)
+            .field("popup_state", &self.popup_state)
+            .field("temp_file", &self.temp_file)
+            .finish()
+    }
+}
+
 impl SnapshotBrowser {
     pub async fn test_s3_connection(&mut self) -> Result<()> {
         if self.s3_client.is_none() {
@@ -376,19 +393,23 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app state
+    // Load configuration from environment variables
+    let env_s3_config = crate::config::load_s3_config();
+    let env_pg_config = crate::config::load_postgres_config();
+    
+    // Create app state with CLI args taking precedence over env vars
     let config = S3Config {
-        bucket: bucket.unwrap_or_default(),
-        region: region.unwrap_or_default(),
-        prefix: prefix.unwrap_or_default(),
-        endpoint_url: endpoint_url.unwrap_or_default(),
-        access_key_id: access_key_id.unwrap_or_default(),
-        secret_access_key: secret_access_key.unwrap_or_default(),
-        path_style,
+        bucket: bucket.as_ref().map_or(env_s3_config.bucket, |b| b.clone()),
+        region: region.as_ref().map_or(env_s3_config.region, |r| r.clone()),
+        prefix: prefix.as_ref().map_or(env_s3_config.prefix, |p| p.clone()),
+        endpoint_url: endpoint_url.as_ref().map_or(env_s3_config.endpoint_url, |e| e.clone()),
+        access_key_id: access_key_id.as_ref().map_or(env_s3_config.access_key_id, |a| a.clone()),
+        secret_access_key: secret_access_key.as_ref().map_or(env_s3_config.secret_access_key, |s| s.clone()),
+        path_style: if bucket.as_ref().is_some() { path_style } else { env_s3_config.path_style },
         error_message: None,
     };
 
-    let pg_config = PostgresConfig::default();
+    let pg_config = env_pg_config;
     let browser = SnapshotBrowser::new(config, pg_config);
 
     // Run app

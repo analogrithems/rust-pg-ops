@@ -1,15 +1,13 @@
-use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 use insta::assert_debug_snapshot;
-use std::time::{Duration, SystemTime};
 
 // We need to use the crate name directly since we're in an integration test
 use postgres_manager::ui::models::{BackupMetadata, FocusField, InputMode, PopupState, PostgresConfig, S3Config};
+use aws_sdk_s3::primitives::DateTime as AwsDateTime;
 
-// Helper function to create a test AwsDateTime
+// Helper function to create a test AwsDateTime with a fixed timestamp
 fn create_test_aws_datetime() -> AwsDateTime {
-    let now = SystemTime::now();
-    let duration = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
-    AwsDateTime::from_secs(duration.as_secs() as i64)
+    // Use a fixed timestamp for testing (2023-01-01 12:00:00 UTC)
+    AwsDateTime::from_secs(1672574400)
 }
 
 #[test]

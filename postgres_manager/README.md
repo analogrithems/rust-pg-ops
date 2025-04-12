@@ -28,7 +28,36 @@ cargo build --release
 
 ## Usage
 
-### Command Line Arguments
+### Configuration
+
+The application can be configured using either command-line arguments or environment variables. Environment variables take precedence over default values but command-line arguments take precedence over environment variables.
+
+#### Environment Variables
+
+Create a `.env` file in the project root with the following variables:
+
+```
+# S3 Configuration
+S3_BUCKET=your-bucket-name
+S3_REGION=us-west-2
+S3_PREFIX=backups/
+S3_ENDPOINT_URL=
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+S3_PATH_STYLE=false
+
+# PostgreSQL Configuration
+PG_HOST=localhost
+PG_PORT=5432
+PG_USERNAME=postgres
+PG_PASSWORD=
+PG_USE_SSL=false
+PG_DB_NAME=postgres
+```
+
+A template file `.env.example` is provided for reference.
+
+#### Command Line Arguments
 
 ```bash
 postgres_manager [OPTIONS]
@@ -125,6 +154,63 @@ cargo build --release
 # Run tests
 cargo test
 ```
+
+## Snapshot Testing
+
+This project uses [insta](https://insta.rs/) for snapshot testing. Snapshot tests help ensure UI components and data structures maintain consistent behavior across code changes.
+
+### Running Snapshot Tests
+
+```bash
+# Run all tests including snapshot tests
+cargo test
+
+# Run only snapshot tests
+cargo test --test browser_tests
+cargo test --test renderer_tests
+```
+
+### Updating Snapshots
+
+When you make intentional changes to the UI or data structures, snapshot tests will fail. To update the snapshots:
+
+1. Run the tests to generate new snapshot files:
+   ```bash
+   cargo test
+   ```
+
+2. Review and accept the changes using the insta review tool:
+   ```bash
+   cargo insta review
+   ```
+   This will open an interactive interface to review and accept/reject changes.
+
+3. Alternatively, you can automatically accept all changes:
+   ```bash
+   cargo insta accept
+   ```
+
+### Adding New Snapshot Tests
+
+To add a new snapshot test:
+
+1. Import the necessary components:
+   ```rust
+   use insta::assert_debug_snapshot;
+   ```
+
+2. Create a test function and use the snapshot assertion:
+   ```rust
+   #[test]
+   fn test_my_component() {
+       let component = MyComponent::new();
+       assert_debug_snapshot!(component);
+   }
+   ```
+
+3. Run the test once to generate the initial snapshot.
+
+Snapshot files are stored in the `tests/snapshots/` directory and should be committed to version control.
 
 ## License
 
