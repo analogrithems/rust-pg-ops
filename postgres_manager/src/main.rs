@@ -18,52 +18,52 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    #[arg(short, long)]
+    #[arg(short, long, help = "Postgres File Path")]
     file: Option<String>,
 
-    #[arg(short = 'H', long)]
+    #[arg(short = 'H', long, help = "Postgres Host")]
     host: Option<String>,
 
-    #[arg(short, default_value = "5432", long)]
+    #[arg(short, default_value = "5432", long, help = "Postgres Port")]
     port: Option<u16>,
 
-    #[arg(short, long)]
+    #[arg(short, long, help = "Postgres Username")]
     username: Option<String>,
 
-    #[arg(short = 'P', long)]
+    #[arg(short = 'P', long, help = "Postgres Password")]
     password: Option<String>,
 
-    #[arg(short = 'D', default_value = "postgres", long)]
+    #[arg(short = 'D', default_value = "postgres", long, help = "Postgres Database Name")]
     db_name: Option<String>,
 
-    #[arg(long, default_value = "true", help = "Enable SSL for the connection")]
+    #[arg(long, default_value = "true", help = "Postgres Enable SSL")]
     use_ssl: bool,
 
-    #[arg(long, help = "Path to custom root certificates")]
+    #[arg(long, help = "Postgres Path to custom root certificates")]
     root_cert_path: Option<String>,
 
-    #[arg(long, default_value = "false", help = "Verify SSL certificates")]
+    #[arg(long, default_value = "false", help = "Postgres Verify SSL certificates")]
     verify_ssl: bool,
 
-    #[arg(short = 'B', long, help = "S3 bucket name")]
+    #[arg(short = 'B', long, help = "S3 Bucket Name")]
     bucket: Option<String>,
 
-    #[arg(short = 'R', long, help = "AWS region")]
+    #[arg(short = 'R', long, help = "S3 Region")]
     region: Option<String>,
 
-    #[arg(short = 'x', long, default_value = "postgres", help = "Prefix for snapshot keys")]
+    #[arg(short = 'x', long, default_value = "postgres", help = "S3 Prefix for snapshot keys")]
     prefix: Option<String>,
 
-    #[arg(short = 'E', long, help = "Custom endpoint URL for S3")]
+    #[arg(short = 'E', long, help = "S3 Endpoint URL")]
     endpoint_url: Option<String>,
 
-    #[arg(short = 'A', long, help = "AWS access key ID")]
+    #[arg(short = 'A', long, help = "S3 Access Key ID")]
     access_key_id: Option<String>,
 
-    #[arg(short = 'S', long, help = "AWS secret access key")]
+    #[arg(short = 'S', long, help = "S3 Secret Access Key")]
     secret_access_key: Option<String>,
 
-    #[arg(long, default_value = "true", help = "Force path-style access to S3")]
+    #[arg(long, default_value = "true", help = "S3 Force path-style")]
     path_style: bool,
 }
 
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
 
     log4rs::init_config(log_config)?;
     info!("Starting postgres_manager");
-    
+
     // Load environment variables from .env file
     config::load_env();
     info!("Loaded environment variables");
