@@ -45,9 +45,9 @@ Options:
 
 ### Interactive Interface
 
-![BrowseSnapshots](https://github.com/analogrithems/rust-pg-ops/tree/main/postgres_manager/sc1.png?raw=true)
+![BrowseSnapshots](https://github.com/analogrithems/rust-pg-ops/blob/main/postgres_manager/sc1.png?raw=true)
 
-![ConfirmRestore](https://github.com/analogrithems/rust-pg-ops/tree/main/postgres_manager/sc2.png?raw=true)
+![ConfirmRestore](https://github.com/analogrithems/rust-pg-ops/blob/main/postgres_manager/sc2.png?raw=true)
 
 The application provides a split-screen interface:
 - Bottom: List of available backups
