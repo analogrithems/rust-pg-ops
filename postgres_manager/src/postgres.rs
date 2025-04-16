@@ -2,8 +2,6 @@ use anyhow::{Context, Result};
 
 use tokio_postgres::Config as PgConfig;
 
-
-
 use log::{error, info};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
