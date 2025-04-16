@@ -8,8 +8,6 @@ use tokio_postgres::Config as PgConfig;
 use log::{error, info, warn, LevelFilter};
 use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
 
-
-
 #[derive(Parser)]
 #[command(name = "postgres_manager")]
 #[command(about = "PostgreSQL database management tool")]
@@ -20,49 +18,49 @@ struct Cli {
     #[arg(short, long, help = "Postgres File Path")]
     file: Option<String>,
 
-    #[arg(short = 'H', long, help = "Postgres Host")]
+    #[arg(short = 'H', long, env = "PG_HOST", help = "Postgres Host")]
     host: Option<String>,
 
-    #[arg(short, default_value = "5432", long, help = "Postgres Port")]
+    #[arg(short, default_value = "5432", long, env = "PG_PORT", help = "Postgres Port")]
     port: Option<u16>,
 
-    #[arg(short, long, help = "Postgres Username")]
+    #[arg(short, long, env = "PG_USERNAME", help = "Postgres Username")]
     username: Option<String>,
 
-    #[arg(short = 'P', long, help = "Postgres Password")]
+    #[arg(short = 'P', long, env = "PG_PASSWORD", help = "Postgres Password")]
     password: Option<String>,
 
-    #[arg(short = 'D', default_value = "postgres", long, help = "Postgres Database Name")]
+    #[arg(short = 'D', default_value = "postgres", long, env = "PG_DB_NAME", help = "Postgres Database Name")]
     db_name: Option<String>,
 
-    #[arg(long, default_value = "true", help = "Postgres Enable SSL")]
+    #[arg(long, default_value = "false", env = "PG_USE_SSL", help = "Postgres Enable SSL")]
     use_ssl: bool,
 
-    #[arg(long, help = "Postgres Path to custom root certificates")]
+    #[arg(long, env = "PG_ROOT_CERT_PATH", help = "Postgres Path to custom root certificates")]
     root_cert_path: Option<String>,
 
-    #[arg(long, default_value = "false", help = "Postgres Verify SSL certificates")]
+    #[arg(long, default_value = "false", env = "PG_VERIFY_SSL", help = "Postgres Verify SSL certificates")]
     verify_ssl: bool,
 
-    #[arg(short = 'B', long, help = "S3 Bucket Name")]
+    #[arg(short = 'B', long, env = "S3_BUCKET", help = "S3 Bucket Name")]
     bucket: Option<String>,
 
-    #[arg(short = 'R', long, help = "S3 Region")]
+    #[arg(short = 'R', long, env = "S3_REGION", help = "S3 Region")]
     region: Option<String>,
 
-    #[arg(short = 'x', long, default_value = "postgres", help = "S3 Prefix for snapshot keys")]
+    #[arg(short = 'x', long, default_value = "postgres", env = "S3_PREFIX", help = "S3 Prefix for snapshot keys")]
     prefix: Option<String>,
 
-    #[arg(short = 'E', long, help = "S3 Endpoint URL")]
+    #[arg(short = 'E', long, env = "S3_ENDPOINT_URL", help = "S3 Endpoint URL")]
     endpoint_url: Option<String>,
 
-    #[arg(short = 'A', long, help = "S3 Access Key ID")]
+    #[arg(short = 'A', long, env = "S3_ACCESS_KEY_ID", help = "S3 Access Key ID")]
     access_key_id: Option<String>,
 
-    #[arg(short = 'S', long, help = "S3 Secret Access Key")]
+    #[arg(short = 'S', long, env = "S3_SECRET_ACCESS_KEY", help = "S3 Secret Access Key")]
     secret_access_key: Option<String>,
 
-    #[arg(long, default_value = "true", help = "S3 Force path-style")]
+    #[arg(long, default_value = "true", env = "S3_PATH_STYLE", help = "S3 Force path-style")]
     path_style: bool,
 }
 
