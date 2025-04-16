@@ -482,20 +482,20 @@ impl SnapshotBrowser {
                 terminal.draw(|f| crate::ui::renderer::ui::<B>(f, self))?;
                 match inner_result {
                     Ok(_) => {
-                        log::info!("Database restore completed successfully");
-                        self.popup_state = PopupState::Success("Database restore completed successfully".to_string());
+                        log::info!("pg_restore completed successfully");
+                        self.popup_state = PopupState::Success("pg_restore completed successfully".to_string());
                     },
                     Err(e) => {
-                        log::error!("Database restore failed: {}", e);
-                        self.popup_state = PopupState::Error(format!("Database restore failed: {}", e));
-                        return Err(e);
+                        log::error!("pg_restore failed: {}", e);
+                        self.popup_state = PopupState::Error(format!("pg_restore failed: {}", e));
+                        return Err(anyhow!("pg_restore task failed: {}", e));
                     }
                 }
             },
             Err(e) => {
-                log::error!("Restore task panicked: {}", e);
-                self.popup_state = PopupState::Error(format!("Restore task failed: {}", e));
-                return Err(anyhow!("Restore task failed: {}", e));
+                log::error!("pg_restore task panicked: {}", e);
+                self.popup_state = PopupState::Error(format!("pg_restore task failed: {}", e));
+                return Err(anyhow!("pg_restore_handler task issues: {}", e));
             }
         }
 
@@ -619,7 +619,9 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                             error!("Error during restore: {}", e);
                                             browser.popup_state = PopupState::Error(format!("Restore error: {}", e));
                                         }
-                                        return Ok(Some(downloaded_path));
+                                        // Don't exit the program, just continue with the UI loop
+                                        // Store the downloaded path in case we need it later
+                                        browser.temp_file = Some(downloaded_path);
                                     },
                                     Ok(None) => {},  // Download was cancelled or failed
                                     Err(e) => {
