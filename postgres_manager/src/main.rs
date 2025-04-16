@@ -89,6 +89,30 @@ enum Commands {
         name: String,
     },
 
+    #[command(about = "Drop a database with force")]
+    DropForce {
+        #[arg(help = "Name of the database to drop")]
+        name: String,
+    },
+
+    #[command(about = "Rename a database")]
+    Rename {
+        #[arg(help = "Name of the database to rename")]
+        old_name: String,
+
+        #[arg(help = "New name for the database")]
+        new_name: String,
+    },
+
+    #[command(about = "Set database owner")]
+    SetOwner {
+        #[arg(help = "Name of the database")]
+        name: String,
+
+        #[arg(help = "New owner for the database")]
+        owner: String,
+    },
+
     #[command(about = "Dump a database")]
     Dump {
         #[arg(help = "Name of the database to dump")]
@@ -181,7 +205,7 @@ async fn main() -> Result<()> {
             if let Some(client) = client {
                 postgres::list_databases(&client).await?;
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::list_databases");
                 return Ok(());
             }
         }
@@ -189,7 +213,7 @@ async fn main() -> Result<()> {
             if let Some(client) = client {
                 postgres::create_database(&client, &name).await?;
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::create_database");
                 return Ok(());
             }
         }
@@ -197,7 +221,7 @@ async fn main() -> Result<()> {
             if let Some(client) = client {
                 postgres::drop_database(&client, &name).await?;
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::drop_database");
                 return Ok(());
             }
         }
@@ -205,7 +229,31 @@ async fn main() -> Result<()> {
             if let Some(client) = client {
                 postgres::clone_database(&client, &name).await?;
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::clone_database");
+                return Ok(());
+            }
+        }
+        Commands::DropForce { name } => {
+            if let Some(client) = client {
+                postgres::drop_database_with_force(&client, &name).await?;
+            } else {
+                error!("PostgreSQL connection required for postgres::drop_database_with_force");
+                return Ok(());
+            }
+        }
+        Commands::Rename { old_name, new_name } => {
+            if let Some(client) = client {
+                postgres::rename_database(&client, &old_name, &new_name).await?;
+            } else {
+                error!("PostgreSQL connection required for postgres::rename_database");
+                return Ok(());
+            }
+        }
+        Commands::SetOwner { name, owner } => {
+            if let Some(client) = client {
+                postgres::set_database_owner(&client, &name, &owner).await?;
+            } else {
+                error!("PostgreSQL connection required for postgres::set_database_owner");
                 return Ok(());
             }
         }
@@ -223,7 +271,7 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::dump_database");
                 return Ok(());
             }
         }
@@ -239,7 +287,7 @@ async fn main() -> Result<()> {
                     cli.use_ssl,
                 )?
             } else {
-                error!("PostgreSQL connection required for this command");
+                error!("PostgreSQL connection required for postgres::restore_database");
                 return Ok(());
             }
         }

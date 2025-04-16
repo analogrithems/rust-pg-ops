@@ -419,7 +419,7 @@ impl SnapshotBrowser {
         let port = self.pg_config.port.unwrap();
         let username = self.pg_config.username.clone();
         let password = self.pg_config.password.clone();
-        // let db_name = self.pg_config.db_name.as_ref().unwrap().clone();
+
         let use_ssl = self.pg_config.use_ssl;
         let file_path_owned = file_path.to_string();
 
@@ -617,7 +617,7 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                                         info!("Starting restore process for downloaded file: {}", downloaded_path);
                                         if let Err(e) = browser.restore_snapshot(&snapshot, terminal, &downloaded_path).await {
                                             error!("Error during restore: {}", e);
-                                            browser.popup_state = PopupState::Error(format!("Restore error: {}", e));
+                                            browser.popup_state = PopupState::Error("pg_restore finished with errors, check postgres_manager.log for details".to_string());
                                         }
                                         // Don't exit the program, just continue with the UI loop
                                         // Store the downloaded path in case we need it later

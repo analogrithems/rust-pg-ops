@@ -88,3 +88,33 @@ pub async fn drop_database(client: &tokio_postgres::Client, name: &str) -> Resul
   info!("Database '{}' dropped successfully", name);
   Ok(())
 }
+
+pub async fn drop_database_with_force(client: &tokio_postgres::Client, name: &str) -> Result<()> {
+  client
+      .execute(&format!("DROP DATABASE \"{}\" WITH (FORCE);", name), &[])
+      .await
+      .context("Failed to drop database")?;
+
+  info!("Database '{}' dropped successfully", name);
+  Ok(())
+}
+
+pub async fn rename_database(client: &tokio_postgres::Client, old_name: &str, new_name: &str) -> Result<()> {
+  client
+      .execute(&format!("ALTER DATABASE \"{}\" RENAME TO \"{}\";", old_name, new_name), &[])
+      .await
+      .context("Failed to rename database")?;
+
+  info!("Database '{}' renamed to '{}' successfully", old_name, new_name);
+  Ok(())
+}
+
+pub async fn set_database_owner(client: &tokio_postgres::Client, name: &str, owner: &str) -> Result<()> {
+  client
+      .execute(&format!("ALTER DATABASE \"{}\" OWNER TO \"{}\";", name, owner), &[])
+      .await
+      .context("Failed to set database owner")?;
+
+  info!("Database '{}' owner set to '{}' successfully", name, owner);
+  Ok(())
+}

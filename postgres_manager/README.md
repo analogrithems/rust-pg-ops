@@ -28,6 +28,42 @@ cargo build --release
 
 ## Usage
 
+### Command Line Operations
+
+The application supports several command-line operations for PostgreSQL database management:
+
+```bash
+# List all databases
+postgres_manager list
+
+# Create a new database
+postgres_manager create <name>
+
+# Clone a database
+postgres_manager clone <name>
+
+# Drop a database
+postgres_manager drop <name>
+
+# Drop a database with force (terminates all connections)
+postgres_manager drop-force <name>
+
+# Rename a database
+postgres_manager rename <old_name> <new_name>
+
+# Set database owner
+postgres_manager set-owner <name> <owner>
+
+# Dump a database to a file
+postgres_manager dump <name> <output>
+
+# Restore a database from a file
+postgres_manager restore <name> <restore_file>
+
+# Launch the interactive TUI browser
+postgres_manager browse-snapshots
+```
+
 ### Configuration
 
 The application can be configured using either command-line arguments or environment variables. Environment variables take precedence over default values but command-line arguments take precedence over environment variables.
