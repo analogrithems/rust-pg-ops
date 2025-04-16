@@ -8,7 +8,10 @@ use std::time::Duration;
 use std::io::stdout;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
+use random_word::Lang;
+use tokio_postgres::Config as PgConfig;
 
+use crate::postgres;
 use crate::ui::models::{S3Config, PostgresConfig, BackupMetadata, PopupState, InputMode, FocusField};
 
 /// Snapshot browser for managing S3 backups
@@ -72,7 +75,7 @@ impl SnapshotBrowser {
         }
     }
 
-    pub async fn test_pg_connection(&mut self) -> Result<()> {
+    pub async fn test_pg_connection(&mut self) -> Result<Option<tokio_postgres::Client>> {
         // Validate PostgreSQL settings
         if self.pg_config.host.is_none() || self.pg_config.host.as_ref().unwrap().is_empty() {
             self.popup_state = PopupState::Error("PostgreSQL host is required".to_string());
@@ -90,19 +93,28 @@ impl SnapshotBrowser {
         }
 
         // Construct connection string
-        let conn_string = format!(
-            "host={} port={} user={} password={} {}{}",
-            self.pg_config.host.as_ref().unwrap(),
-            self.pg_config.port.unwrap(),
-            self.pg_config.username.as_ref().unwrap(),
-            self.pg_config.password.as_ref().unwrap_or(&String::new()),
-            if self.pg_config.use_ssl { "sslmode=require " } else { "" },
-            if let Some(db) = &self.pg_config.db_name { format!("dbname={}", db) } else { String::new() }
-        );
-
-        // For now, just show a success message
-        self.popup_state = PopupState::TestPgResult(format!("Connection string: {}", conn_string));
-        Ok(())
+        let mut config = PgConfig::new();
+        config.host(self.pg_config.host.as_ref().unwrap());
+        config.port(self.pg_config.port.unwrap());
+        config.user(self.pg_config.username.as_ref().unwrap());
+        config.password(&self.pg_config.password.as_ref().unwrap_or(&String::new()));
+        let result = if self.pg_config.use_ssl {
+            postgres::connect_ssl(&config, false, None).await
+        } else {
+            postgres::connect_no_ssl(&config).await
+        };
+        match result {
+            Ok(client) => {
+                info!("Successfully connected to PostgreSQL");
+                self.popup_state = PopupState::TestPgResult(format!("Successfully connected to PostgreSQL\nConnection string: {:?}", config));
+                Ok(Some(client))
+            },
+            Err(e) => {
+                let error_msg = format!("Failed to connect to PostgreSQL: {}", e);
+                self.popup_state = PopupState::Error(error_msg.clone());
+                Err(anyhow!(error_msg))
+            }
+        }
     }
 
     pub fn new(config: S3Config, pg_config: PostgresConfig) -> Self {
@@ -374,6 +386,125 @@ impl SnapshotBrowser {
             return Ok(None);
         }
     }
+
+    /// Restore a database from a downloaded snapshot file
+    pub async fn restore_snapshot<B: Backend>(&mut self, snapshot: &BackupMetadata, terminal: &mut Terminal<B>, file_path: &str) -> Result<()> {
+        // Validate PostgreSQL settings
+        if self.pg_config.host.is_none() || self.pg_config.host.as_ref().unwrap().is_empty() {
+            self.popup_state = PopupState::Error("PostgreSQL host is required".to_string());
+            return Err(anyhow!("PostgreSQL host is required"));
+        }
+
+        if self.pg_config.port.is_none() {
+            self.popup_state = PopupState::Error("PostgreSQL port is required".to_string());
+            return Err(anyhow!("PostgreSQL port is required"));
+        }
+
+        if self.pg_config.username.is_none() || self.pg_config.username.as_ref().unwrap().is_empty() {
+            self.popup_state = PopupState::Error("PostgreSQL username is required".to_string());
+            return Err(anyhow!("PostgreSQL username is required"));
+        }
+
+        if self.pg_config.db_name.is_none() || self.pg_config.db_name.as_ref().unwrap().is_empty() {
+            self.popup_state = PopupState::Error("PostgreSQL database name is required".to_string());
+            return Err(anyhow!("PostgreSQL database name is required"));
+        }
+
+        // Start restore operation
+        self.popup_state = PopupState::Restoring(snapshot.clone(), 0.0);
+        terminal.draw(|f| crate::ui::renderer::ui::<B>(f, self))?;
+
+        // Use a separate thread for the restore operation to avoid blocking the UI
+        let host = self.pg_config.host.as_ref().unwrap().clone();
+        let port = self.pg_config.port.unwrap();
+        let username = self.pg_config.username.clone();
+        let password = self.pg_config.password.clone();
+        // let db_name = self.pg_config.db_name.as_ref().unwrap().clone();
+        let use_ssl = self.pg_config.use_ssl;
+        let file_path_owned = file_path.to_string();
+
+        let pgclient = self.test_pg_connection().await?;
+
+        let new_dbname = format!("{}-restored", random_word::get(Lang::En));
+        let create_restore_db = crate::postgres::create_database(&pgclient.unwrap(), &new_dbname).await;
+
+        match create_restore_db {
+            Ok(_) => {
+                log::info!("Successfully created restore database: {}", new_dbname);
+            },
+            Err(e) => {
+                let error_msg = format!("Failed to create restore database: {}", e);
+                self.popup_state = PopupState::Error(error_msg.clone());
+                return Err(anyhow!(error_msg));
+            }
+        }
+        // Spawn a blocking task to handle the restore operation
+        let restore_handle = tokio::task::spawn_blocking(move || {
+            // Call the restore_database function from the backup module
+            let result = crate::backup::restore_database(
+                &new_dbname,
+                &file_path_owned,
+                &host,
+                port,
+                username.as_deref(),
+                password.as_deref(),
+                use_ssl,
+            );
+            result
+        });
+
+        // Send completion signal (100% progress) in the main async context after restore completes
+        // Update the UI with progress while the restore is running
+        let mut progress = 0.0;
+        // Only update progress bar at the end (no fine-grained progress for pg_restore)
+        while progress < 1.0 {
+            // Check for user input (like ESC key) during restore
+            if crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                if let crossterm::event::Event::Key(key) = crossterm::event::read().unwrap_or(crossterm::event::Event::Key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Null, crossterm::event::KeyModifiers::NONE))) {
+                    if key.code == crossterm::event::KeyCode::Esc {
+                        log::debug!("User pressed ESC during restore, but restore cannot be cancelled");
+                        // We don't allow cancelling restore operations as they can leave the database in an inconsistent state
+                    }
+                }
+            }
+            // Update the UI
+            self.popup_state = PopupState::Restoring(snapshot.clone(), progress);
+            terminal.draw(|f| crate::ui::renderer::ui::<B>(f, self))?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // For now, break after a short wait and update progress to 1.0 when done
+            break;
+        }
+        // Wait for the restore operation to complete
+        match restore_handle.await {
+            Ok(inner_result) => {
+                progress = 1.0;
+                self.popup_state = PopupState::Restoring(snapshot.clone(), progress);
+                terminal.draw(|f| crate::ui::renderer::ui::<B>(f, self))?;
+                match inner_result {
+                    Ok(_) => {
+                        log::info!("Database restore completed successfully");
+                        self.popup_state = PopupState::Success("Database restore completed successfully".to_string());
+                    },
+                    Err(e) => {
+                        log::error!("Database restore failed: {}", e);
+                        self.popup_state = PopupState::Error(format!("Database restore failed: {}", e));
+                        return Err(e);
+                    }
+                }
+            },
+            Err(e) => {
+                log::error!("Restore task panicked: {}", e);
+                self.popup_state = PopupState::Error(format!("Restore task failed: {}", e));
+                return Err(anyhow!("Restore task failed: {}", e));
+            }
+        }
+
+        // Show final status message
+        terminal.draw(|f| crate::ui::renderer::ui::<B>(f, self))?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        Ok(())
+    }
 }
 
 /// Run the TUI application
@@ -396,7 +527,7 @@ pub async fn run_tui(
     // Load configuration from environment variables
     let env_s3_config = crate::config::load_s3_config();
     let env_pg_config = crate::config::load_postgres_config();
-    
+
     // Create app state with CLI args taking precedence over env vars
     let config = S3Config {
         bucket: bucket.as_ref().map_or(env_s3_config.bucket, |b| b.clone()),
@@ -473,13 +604,23 @@ pub async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut browser: Snapsh
                         KeyCode::Char('y') if matches!(browser.popup_state, PopupState::ConfirmRestore(_)) => {
                             if let Some(snapshot) = browser.selected_snapshot().cloned() {
                                 info!("User confirmed restore of snapshot: {}", snapshot.key);
-                                // Create a temporary file
-                                let temp_dir = tempfile::Builder::new().prefix("pg-backup-").tempdir()?;
-                                let temp_path = temp_dir.path().join("backup.sql");
+                                // Create a persistent file in the system's temp directory
+                                let temp_dir = std::env::temp_dir();
+                                let file_name = format!("pg-backup-{}.sql", chrono::Utc::now().timestamp());
+                                let temp_path = temp_dir.join(file_name);
+                                info!("Creating persistent backup file at: {}", temp_path.display());
 
                                 // Start download
                                 match browser.download_snapshot(&snapshot, terminal, &temp_path).await {
-                                    Ok(Some(downloaded_path)) => return Ok(Some(downloaded_path)),
+                                    Ok(Some(downloaded_path)) => {
+                                        // Now that we have the file, start the restore process
+                                        info!("Starting restore process for downloaded file: {}", downloaded_path);
+                                        if let Err(e) = browser.restore_snapshot(&snapshot, terminal, &downloaded_path).await {
+                                            error!("Error during restore: {}", e);
+                                            browser.popup_state = PopupState::Error(format!("Restore error: {}", e));
+                                        }
+                                        return Ok(Some(downloaded_path));
+                                    },
                                     Ok(None) => {},  // Download was cancelled or failed
                                     Err(e) => {
                                         error!("Error during download: {}", e);

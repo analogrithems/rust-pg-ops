@@ -67,6 +67,7 @@ pub enum PopupState {
     ConfirmRestore(BackupMetadata),
     Downloading(BackupMetadata, f32, f64),
     ConfirmCancel(BackupMetadata, f32, f64),
+    Restoring(BackupMetadata, f32),  // Snapshot being restored, progress percentage
     TestS3Result(String),
     TestPgResult(String),
     Error(String),

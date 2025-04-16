@@ -1,14 +1,13 @@
 use postgres_manager::{backup, ui, config};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand, command, arg};
-
-use tokio_postgres::Config as PgConfig;
+use postgres_manager::postgres;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::Config as PgConfig;
 use log::{error, info, warn, LevelFilter};
 use log4rs::{append::file::FileAppender, config::{Appender, Config as LogConfig, Root}, encode::pattern::PatternEncoder};
-use native_tls::TlsConnector;
-use postgres_native_tls::MakeTlsConnector;
+
 
 
 #[derive(Parser)]
@@ -112,42 +111,6 @@ enum Commands {
     BrowseSnapshots,
 }
 
-async fn connect_ssl(config: &PgConfig, verify: bool, root_cert_path: Option<&str>) -> Result<tokio_postgres::Client> {
-    let mut builder = TlsConnector::builder();
-    if !verify {
-        builder.danger_accept_invalid_certs(true);
-    }
-    if let Some(path) = root_cert_path {
-        let cert_data = std::fs::read(path)?;
-        let cert = native_tls::Certificate::from_pem(&cert_data)?;
-        builder.add_root_certificate(cert);
-    }
-    let connector = builder.build()?;
-    let connector = MakeTlsConnector::new(connector);
-
-    let (client, connection) = config.connect(connector).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("connection error: {}", e);
-        }
-    });
-
-    Ok(client)
-}
-
-async fn connect_no_ssl(config: &PgConfig) -> Result<tokio_postgres::Client> {
-    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("connection error: {}", e);
-        }
-    });
-
-    Ok(client)
-}
-
 async fn connect(cli: &Cli) -> Result<Option<tokio_postgres::Client>> {
     if !cli.host.is_some() && !cli.port.is_some() && !cli.username.is_some() && !cli.password.is_some() {
         // If no PostgreSQL settings are provided, return None
@@ -173,9 +136,9 @@ async fn connect(cli: &Cli) -> Result<Option<tokio_postgres::Client>> {
     }
 
     let result = if cli.use_ssl {
-        connect_ssl(&config, cli.verify_ssl, cli.root_cert_path.as_deref()).await
+        postgres::connect_ssl(&config, cli.verify_ssl, cli.root_cert_path.as_deref()).await
     } else {
-        connect_no_ssl(&config).await
+        postgres::connect_no_ssl(&config).await
     };
 
     match result {
@@ -185,52 +148,7 @@ async fn connect(cli: &Cli) -> Result<Option<tokio_postgres::Client>> {
             Ok(None)
         }
     }
-}
-
-async fn list_databases(client: &tokio_postgres::Client) -> Result<()> {
-    let rows = client
-        .query("SELECT datname FROM pg_database WHERE datistemplate = false;", &[])
-        .await?;
-
-    println!("Available databases:");
-    for row in rows {
-        let name: String = row.get(0);
-        println!("  - {}", name);
-    }
-
-    Ok(())
-}
-
-async fn create_database(client: &tokio_postgres::Client, name: &str) -> Result<()> {
-    client
-        .execute(&format!("CREATE DATABASE \"{}\";", name), &[])
-        .await
-        .context("Failed to create database")?;
-
-    info!("Database '{}' created successfully", name);
-    Ok(())
-}
-
-async fn clone_database(client: &tokio_postgres::Client, name: &str) -> Result<()> {
-    let new_name = format!("{}-clone", name);
-    client
-        .execute(&format!("CREATE DATABASE \"{}\" WITH TEMPLATE \"{}\" OWNER \"{}\" ;", new_name, name, name), &[])
-        .await
-        .context("Failed to clone database")?;
-
-    info!("Database '{}' cloned to '{}' successfully", name, new_name);
-    Ok(())
-}
-
-async fn drop_database(client: &tokio_postgres::Client, name: &str) -> Result<()> {
-    client
-        .execute(&format!("DROP DATABASE \"{}\" WITH (FORCE);", name), &[])
-        .await
-        .context("Failed to drop database")?;
-
-    info!("Database '{}' dropped successfully", name);
-    Ok(())
-}
+  }
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -261,7 +179,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::List => {
             if let Some(client) = client {
-                list_databases(&client).await?;
+                postgres::list_databases(&client).await?;
             } else {
                 error!("PostgreSQL connection required for this command");
                 return Ok(());
@@ -269,7 +187,7 @@ async fn main() -> Result<()> {
         }
         Commands::Create { name } => {
             if let Some(client) = client {
-                create_database(&client, &name).await?;
+                postgres::create_database(&client, &name).await?;
             } else {
                 error!("PostgreSQL connection required for this command");
                 return Ok(());
@@ -277,7 +195,7 @@ async fn main() -> Result<()> {
         }
         Commands::Drop { name } => {
             if let Some(client) = client {
-                drop_database(&client, &name).await?;
+                postgres::drop_database(&client, &name).await?;
             } else {
                 error!("PostgreSQL connection required for this command");
                 return Ok(());
@@ -285,7 +203,7 @@ async fn main() -> Result<()> {
         }
         Commands::Clone { name } => {
             if let Some(client) = client {
-                clone_database(&client, &name).await?;
+                postgres::clone_database(&client, &name).await?;
             } else {
                 error!("PostgreSQL connection required for this command");
                 return Ok(());
@@ -319,8 +237,7 @@ async fn main() -> Result<()> {
                     cli.username.as_deref(),
                     cli.password.as_deref(),
                     cli.use_ssl,
-                )
-                .await?
+                )?
             } else {
                 error!("PostgreSQL connection required for this command");
                 return Ok(());
@@ -339,8 +256,9 @@ async fn main() -> Result<()> {
             ).await?;
 
             if let Some(snapshot_key) = res {
-                // Handle the selected snapshot
-                info!("Selected snapshot: {}", snapshot_key);
+                // The snapshot has been downloaded and restored through the UI
+                info!("Snapshot processed: {}", snapshot_key);
+                // The restore operation is handled within the UI flow
             }
         }
     }

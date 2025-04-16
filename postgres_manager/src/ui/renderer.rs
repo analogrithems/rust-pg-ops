@@ -476,6 +476,38 @@ pub fn ui<B: Backend>(f: &mut Frame, browser: &mut SnapshotBrowser) {
             .alignment(Alignment::Center);
             f.render_widget(popup, area);
         }
+        PopupState::Restoring(snapshot, progress) => {
+            let area = centered_rect(60, 7, f.size());
+            // Clear the area where the popup will be rendered
+            f.render_widget(ratatui::widgets::Clear, area);
+            
+            // Create a progress bar
+            let _progress_percent = (*progress * 100.0) as u16;
+            let progress_bar_width = 50;
+            let filled_width = (progress_bar_width as f32 * *progress) as usize;
+            let empty_width = progress_bar_width as usize - filled_width;
+            
+            let progress_bar = format!(
+                "[{}{}] {:.1}%",
+                "=".repeat(filled_width),
+                " ".repeat(empty_width),
+                *progress * 100.0
+            );
+            
+            let popup = Paragraph::new(vec![
+                Line::from(vec![Span::raw(format!("Restoring database from: {}", snapshot.key))]),
+                Line::from(vec![]),
+                Line::from(vec![Span::styled(
+                    progress_bar,
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(vec![]),
+                Line::from(vec![Span::raw("This operation cannot be cancelled")]),
+            ])
+            .block(Block::default().title("Restoring Database").borders(Borders::ALL))
+            .alignment(Alignment::Center);
+            f.render_widget(popup, area);
+        }
         _ => {}
     }
 

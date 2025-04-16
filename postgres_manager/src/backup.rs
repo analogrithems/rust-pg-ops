@@ -46,7 +46,7 @@ pub async fn dump_database(
     Ok(())
 }
 
-pub async fn restore_database(
+pub fn restore_database(
     name: &str,
     input: &str,
     host: &str,
@@ -57,25 +57,37 @@ pub async fn restore_database(
 ) -> Result<()> {
     // Add PGSSLMODE environment variable if SSL is enabled
     if ssl {
+        // Set PGSSLMODE to require
+        log::info!("Setting PGSSLMODE to require");
         std::env::set_var("PGSSLMODE", "require");
+    }else {
+        // Set PGSSLMODE to disable
+        log::info!("Setting PGSSLMODE to disable");
+        std::env::set_var("PGSSLMODE", "disable");
     }
 
     debug!("Building pg_restore command");
+
     let mut cmd = Command::new("pg_restore");
-    cmd.arg("--dbname").arg(name)
-        .arg("--host").arg(host)
-        .arg("--file").arg(input)
-        .arg("--port").arg(port.to_string());
+    cmd.arg("--host").arg(host)
+        .arg("--port").arg(port.to_string())
+        .arg("-C").arg("-c").arg("--if-exists")
+        .arg("--dbname").arg(name)
+        .arg(input);
 
     if let Some(user) = username {
         cmd.arg("--username").arg(user);
     }
 
     if let Some(pass) = password {
-        cmd.arg("--password").arg(pass);
+        std::env::set_var("PGPASSWORD", pass);
     }
 
-    debug!("Executing pg_restore command");
+    // Create a debug-friendly representation of the command
+    let cmd_str = format!("pg_restore --host {} --port {} -C -c --if-exists --dbname {} {} {}",
+        host, port, name, username.map_or(String::new(), |u| format!(" --username {}", u)), input,
+    );
+    debug!("Executing pg_restore command: {} to database {}", cmd_str, name);
     let output = cmd
         .output()
         .context("Failed to execute pg_restore")?;
